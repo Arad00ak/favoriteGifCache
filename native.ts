@@ -4,10 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-/*
- * Desktop-only helpers (Node / Electron). Used when the user picks a folder
- * for the GIF cache instead of IndexedDB.
- */
+
 
 import { app, dialog } from "electron";
 import {
@@ -61,13 +58,13 @@ export function getDefaultCacheDir() {
     return join(app.getPath("userData"), "FavoriteGifCache");
 }
 
-/** Hosts we are willing to pull favorite media from (main process = no CORS). */
+
 const ALLOWED_MEDIA_HOSTS = [
-    // Tenor (legacy — may die; Klipy fallbacks tried in media.ts)
+
     "media.tenor.com",
     "tenor.com",
     "c.tenor.com",
-    // Klipy (Tenor replacement Discord / partners are moving to)
+
     "static.klipy.com",
     "api.klipy.com",
     "media.klipy.com",
@@ -78,7 +75,7 @@ const ALLOWED_MEDIA_HOSTS = [
     "media2.klipy.com",
     "c.klipy.com",
     "klipy.com",
-    // Giphy
+
     "media.giphy.com",
     "media0.giphy.com",
     "media1.giphy.com",
@@ -86,7 +83,7 @@ const ALLOWED_MEDIA_HOSTS = [
     "media3.giphy.com",
     "media4.giphy.com",
     "i.giphy.com",
-    // Discord CDN / proxy
+
     "media.discordapp.net",
     "cdn.discordapp.com",
     "images-ext-1.discordapp.net",
@@ -95,7 +92,7 @@ const ALLOWED_MEDIA_HOSTS = [
     "discord.com",
 ];
 
-const DEFAULT_MAX_DOWNLOAD = 12 * 1024 * 1024; // 12 MB
+const DEFAULT_MAX_DOWNLOAD = 12 * 1024 * 1024;
 
 function hostAllowed(hostname: string) {
     const h = hostname.toLowerCase();
@@ -105,10 +102,7 @@ function hostAllowed(hostname: string) {
     return ALLOWED_MEDIA_HOSTS.some(a => h === a || h.endsWith("." + a));
 }
 
-/**
- * Download favorite media in the Electron main process (bypasses renderer CORS).
- * Rejects oversized files so huge mp4s never enter the cache.
- */
+
 export async function fetchMedia(
     _e: unknown,
     url: string,
@@ -182,7 +176,7 @@ export async function loadAllEntries(_e: unknown, dir: string): Promise<NativeCa
                 size: typeof info.size === "number" ? info.size : buf.byteLength,
             });
         } catch {
-            // skip broken row
+
         }
     }
     return out;
@@ -217,7 +211,7 @@ export async function deleteEntry(_e: unknown, dir: string, key: string) {
             try {
                 unlinkSync(full);
             } catch {
-                // ignore
+
             }
         }
     }
@@ -239,14 +233,14 @@ export async function clearCacheDir(_e: unknown, dir: string) {
             try {
                 unlinkSync(join(bdir, name));
             } catch {
-                // ignore
+
             }
         }
     }
     writeMeta(dir, {});
 }
 
-/** Wipe directory contents entirely (optional hard reset). */
+
 export async function wipeCacheDir(_e: unknown, dir: string) {
     if (!dir || !existsSync(dir)) return;
     rmSync(dir, { recursive: true, force: true });

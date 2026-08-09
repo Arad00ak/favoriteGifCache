@@ -1,5 +1,5 @@
 /*
- * Vencord / Equicord userplugin — FavoriteGifCache
+ * Vencord / Equicord userplugin - FavoriteGifCache
  * Copyright (c) 2026 Arad and contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
@@ -13,13 +13,8 @@ import definePlugin, { OptionType } from "@utils/types";
 import type { PluginNative } from "@utils/types";
 import { Menu, Toasts, useEffect, useState } from "@webpack/common";
 
-/** Soft size budget shown in settings and enforced on put / load (disk + catalog). */
 const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;
-/**
- * Hard cap on how much decoded media we keep in the renderer heap at once.
- * Disk can still hold up to maxBytes; cold entries unload payload and reload on demand.
- * Without this, a full 500 MB catalog OOMs Discord.
- */
+
 const SOFT_MEMORY_BYTES = 80 * 1024 * 1024;
 
 interface CacheMeta {
@@ -37,24 +32,20 @@ interface CacheEntry extends CacheMeta {
 
 interface CacheCoreOptions {
     maxBytes?: number;
-    /** In-heap payload budget (default SOFT_MEMORY_BYTES). */
+    
     softMemoryBytes?: number;
     now?: () => number;
 }
 
 interface PutOptions {
-    /**
-     * When false (default), refuse to store a new key if the cache is already full.
-     * Stops scroll/prefetch from kicking out stuff just to make room for something else.
-     * When true, drop the least-used entry (prefer ones not marked protected).
-     */
+    
     allowEvict?: boolean;
 }
 
 interface PutResult {
     stored: boolean;
     evictedKeys: string[];
-    /** true when we skipped insert because the cache was full and eviction was off */
+    
     skippedFull?: boolean;
 }
 
@@ -64,8 +55,10 @@ class GifCacheCore {
     private softMemoryBytes: number;
     private totalBytes = 0;
     private readonly now: () => number;
-    /** Keys we try not to evict (usually still in Discord favorites). */
+    
     private protectedKeys = new Set<string>();
+    
+    private displayPinnedKeys = new Set<string>();
 
     constructor(options: CacheCoreOptions = {}) {
         this.maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
@@ -94,6 +87,15 @@ class GifCacheCore {
         return [...this.protectedKeys];
     }
 
+    
+    setDisplayPinnedKeys(keys: Iterable<string>) {
+        this.displayPinnedKeys = new Set(keys);
+    }
+
+    getDisplayPinnedKeys(): string[] {
+        return [...this.displayPinnedKeys];
+    }
+
     size() {
         return this.entries.size;
     }
@@ -102,7 +104,7 @@ class GifCacheCore {
         return this.totalBytes;
     }
 
-    /** Bytes of payload currently resident in the renderer heap. */
+    
     residentBytes() {
         let n = 0;
         for (const e of this.entries.values()) n += e.data.byteLength;
@@ -117,7 +119,7 @@ class GifCacheCore {
         return this.entries.has(key);
     }
 
-    /** True when the key is cataloged but payload was unloaded to free RAM. */
+    
     needsHydrate(key: string) {
         const entry = this.entries.get(key);
         return !!entry && entry.size > 0 && entry.data.byteLength === 0;
@@ -155,11 +157,7 @@ class GifCacheCore {
         return [...this.entries.values()].map(({ data: _d, ...meta }) => ({ ...meta }));
     }
 
-    /**
-     * Store bytes for a key.
-     * Overwrite of an existing key never grows the entry count.
-     * New keys only push others out when allowEvict is true.
-     */
+    
     put(
         key: string,
         data: Uint8Array,
@@ -185,7 +183,7 @@ class GifCacheCore {
 
         while (this.totalBytes + size > this.maxBytes) {
             if (!allowEvict) {
-                // put existing back if we stripped it for rewrite and can't finish
+
                 if (existing) {
                     this.entries.set(existing.key, existing);
                     this.totalBytes += existing.size;
@@ -237,7 +235,7 @@ class GifCacheCore {
         this.totalBytes = 0;
     }
 
-    /** Load from disk without touching use counts. */
+    
     loadEntry(entry: CacheEntry) {
         const payload = entry.data instanceof Uint8Array
             ? entry.data.slice()
@@ -247,7 +245,7 @@ class GifCacheCore {
             this.totalBytes -= prev.size;
             this.entries.delete(entry.key);
         }
-        // Prefer stored size when present so unloaded shells (data empty) still account disk usage
+
         const size = payload.byteLength > 0
             ? payload.byteLength
             : (typeof entry.size === "number" && entry.size > 0 ? entry.size : payload.byteLength);
@@ -264,10 +262,7 @@ class GifCacheCore {
         this.totalBytes += next.size;
     }
 
-    /**
-     * Drop cold payloads from the heap until under softMemoryBytes.
-     * Catalog (size/meta) stays; disk copy is untouched. Returns unloaded keys.
-     */
+    
     ensureSoftMemory(keepKey?: string): string[] {
         const unloaded: string[] = [];
         while (this.residentBytes() > this.softMemoryBytes) {
@@ -280,7 +275,7 @@ class GifCacheCore {
         return unloaded;
     }
 
-    /** Prefer cold, unprotected, resident payloads for RAM unload (not full eviction). */
+    
     private pickDataVictim(exceptKey?: string): CacheEntry | null {
         let bestUnprotected: CacheEntry | null = null;
         let bestAny: CacheEntry | null = null;
@@ -288,6 +283,8 @@ class GifCacheCore {
         for (const entry of this.entries.values()) {
             if (exceptKey && entry.key === exceptKey) continue;
             if (entry.data.byteLength === 0) continue;
+
+            if (this.displayPinnedKeys.has(entry.key)) continue;
 
             if (!this.protectedKeys.has(entry.key)) {
                 if (!bestUnprotected || this.isWorse(entry, bestUnprotected)) {
@@ -302,10 +299,7 @@ class GifCacheCore {
         return bestUnprotected ?? bestAny;
     }
 
-    /**
-     * Least-used first, then oldest lastUsed.
-     * Prefer kicking unprotected keys (not in the current favorites set).
-     */
+    
     pickVictim(exceptKey?: string): CacheEntry | null {
         let bestUnprotected: CacheEntry | null = null;
         let bestAny: CacheEntry | null = null;
@@ -358,7 +352,6 @@ interface StorageBackend {
     deleteMany(keys: string[]): Promise<void>;
 }
 
-// Stable name so closing Discord does not wipe the DB
 const DB_NAME = "FavoriteGifCache";
 const DB_VERSION = 1;
 const STORE = "gifs";
@@ -386,7 +379,6 @@ function toEntry(raw: any): CacheEntry {
     };
 }
 
-/** In-memory backend for tests / environments without IDB. */
 class MemoryStorageBackend implements StorageBackend {
     readonly name = "memory";
     private map = new Map<string, CacheEntry>();
@@ -424,10 +416,6 @@ class MemoryStorageBackend implements StorageBackend {
     }
 }
 
-/**
- * IndexedDB store. Lives in the Discord profile, survives restarts.
- * Plugin disable only drops the in-memory layer; this stays put.
- */
 class IndexedDBStorageBackend implements StorageBackend {
     readonly name = "indexeddb";
     private db: IDBDatabase | null = null;
@@ -530,10 +518,6 @@ class IndexedDBStorageBackend implements StorageBackend {
     }
 }
 
-/**
- * Folder on disk via plugin native.ts (desktop only).
- * Each entry is a blob file + meta.json row.
- */
 class FileStorageBackend implements StorageBackend {
     readonly name = "filesystem";
     constructor(
@@ -635,25 +619,12 @@ function createBackendForPath(
     return createDefaultBackend();
 }
 
-/**
- * GIF CDN host helpers.
- * Tenor (media CDN) is sunsetting third-party use; Discord and others move to Klipy.
- * We treat both as first-class and rewrite failed Tenor downloads to Klipy host candidates.
- */
-
-/** Hosts / suffixes that count as Tenor media. */
 const TENOR_HOST_MARKERS = [
     "media.tenor.com",
     "c.tenor.com",
     "tenor.com",
 ] as const;
 
-/**
- * Klipy media / CDN host candidates (Discord & partners may use any of these).
- * Host-swap fallbacks for dead Tenor URLs try these with the same path.
- * Prefer hosts that currently resolve publicly (static / api); keep others as
- * future-proof candidates for when Discord ships more CDN names.
- */
 const KLIPY_MEDIA_HOSTS = [
     "static.klipy.com",
     "api.klipy.com",
@@ -699,7 +670,6 @@ function isKlipyUrl(url: string): boolean {
     return !!h && isKlipyHost(h);
 }
 
-/** Shared GIF provider hosts (Tenor, Klipy, Giphy, Discord CDN). */
 function isGifProviderHost(hostname: string): boolean {
     const h = hostname.toLowerCase();
     if (isTenorHost(h) || isKlipyHost(h)) return true;
@@ -716,10 +686,6 @@ function isGifProviderHost(hostname: string): boolean {
     return false;
 }
 
-/**
- * When a Tenor media URL fails (CDN dead / blocked), try same path on Klipy hosts.
- * Path + query preserved. Original URL is NOT included (caller already tried it).
- */
 function tenorToKlipyFallbackUrls(url: string): string[] {
     if (!isTenorUrl(url)) return [];
     let parsed: URL;
@@ -735,23 +701,19 @@ function tenorToKlipyFallbackUrls(url: string): string[] {
         try {
             const u = new URL(parsed.href);
             u.hostname = host;
-            // keep https
+
             u.protocol = "https:";
             const href = u.href;
             if (seen.has(href)) continue;
             seen.add(href);
             out.push(href);
         } catch {
-            // skip bad host
+
         }
     }
     return out;
 }
 
-/**
- * Download / resolve candidate list: original first, then Klipy fallbacks for Tenor.
- * Deduped. Non-Tenor URLs return just the original.
- */
 function mediaDownloadCandidates(url: string): string[] {
     if (!url) return [];
     const out = [url];
@@ -764,10 +726,6 @@ function mediaDownloadCandidates(url: string): string[] {
     return out;
 }
 
-/**
- * Cache lookup keys: original + host-normalized origin/path + Klipy rewrites of Tenor.
- * Lets a blob stored under a Klipy fallback still hit when Discord shows a Tenor favorite URL.
- */
 function mediaLookupKeys(url: string): string[] {
     if (!url) return [];
     const keys: string[] = [];
@@ -786,7 +744,7 @@ function mediaLookupKeys(url: string): string[] {
         }
         add(u.href);
     } catch {
-        // keep raw
+
     }
 
     for (const alt of tenorToKlipyFallbackUrls(url)) {
@@ -795,24 +753,77 @@ function mediaLookupKeys(url: string): string[] {
             const u = new URL(alt);
             add(`${u.origin}${u.pathname}`);
         } catch {
-            // skip
+
         }
     }
 
     return keys;
 }
 
+function sniffMime(data: Uint8Array, fallback = "application/octet-stream"): string {
+    if (!data || data.byteLength < 4) return fallback;
+
+    if (
+        data.byteLength >= 6
+        && data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46
+        && data[3] === 0x38 && (data[4] === 0x37 || data[4] === 0x39) && data[5] === 0x61
+    ) {
+        return "image/gif";
+    }
+
+    if (
+        data.byteLength >= 8
+        && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47
+    ) {
+        return "image/png";
+    }
+
+    if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+        return "image/jpeg";
+    }
+
+    if (
+        data.byteLength >= 12
+        && data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46
+        && data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50
+    ) {
+        return "image/webp";
+    }
+
+    if (
+        data.byteLength >= 12
+        && data[4] === 0x66 && data[5] === 0x74 && data[6] === 0x79 && data[7] === 0x70
+    ) {
+        return "video/mp4";
+    }
+
+    if (data[0] === 0x1a && data[1] === 0x45 && data[2] === 0xdf && data[3] === 0xa3) {
+        return "video/webm";
+    }
+
+    return fallback;
+}
+
+function isSniffedVideoMime(mime: string | null | undefined) {
+    if (!mime) return false;
+    const m = mime.toLowerCase().split(";")[0]!.trim();
+    return m.startsWith("video/") || m === "application/mp4";
+}
+
+function isSniffedImageMime(mime: string | null | undefined) {
+    if (!mime) return false;
+    const m = mime.toLowerCase().split(";")[0]!.trim();
+    return m.startsWith("image/");
+}
+
 interface FavoriteGifCacheOptions extends CacheCoreOptions {
     backend?: StorageBackend;
-    /**
-     * When false, put(..., { allowEvict: true }) will not drop old entries.
-     * New items are refused if the cache is full.
-     */
+    
     smartEviction?: boolean;
 }
 
 interface BlobUrlOptions {
-    /** Bump use stats (default true on display, false when just warming). */
+    
     bumpUsage?: boolean;
 }
 
@@ -852,14 +863,12 @@ class FavoriteGifCache {
             this.ready = (async () => {
                 await this.backend.open();
                 const all = await this.backend.getAll();
-                // Load one-by-one and soft-unload as we go so a 167–500 MB catalog
-                // never spikes the whole thing into the renderer heap at once.
+
                 for (const entry of all) {
                     this.core.loadEntry(entry);
                     for (const key of this.core.ensureSoftMemory()) this.revokeBlob(key);
                 }
 
-                // only trim if the user lowered the size setting since last run
                 const before = new Set(this.core.keys());
                 const removed = this.core.setMaxBytes(this.core.getMaxBytes());
                 const gone = removed.length
@@ -875,10 +884,7 @@ class FavoriteGifCache {
         await this.ready;
     }
 
-    /**
-     * Ensure payload bytes are in RAM (reload from disk if soft-unloaded).
-     * Returns false if missing entirely.
-     */
+    
     async hydrate(key: string): Promise<boolean> {
         await this.init();
         if (!this.core.has(key)) return false;
@@ -908,9 +914,14 @@ class FavoriteGifCache {
         }
     }
 
-    /** Tell the cache which keys are still Discord favorites (eviction avoids these). */
+    
     setProtectedKeys(keys: Iterable<string>) {
         this.core.setProtectedKeys(keys);
+    }
+
+    
+    setDisplayPinnedKeys(keys: Iterable<string>) {
+        this.core.setDisplayPinnedKeys(keys);
     }
 
     size() {
@@ -942,7 +953,7 @@ class FavoriteGifCache {
         if (this.core.needsHydrate(key)) await this.hydrate(key);
         const entry = this.core.get(key);
         if (!entry || entry.data.byteLength === 0) return null;
-        // only rewrite disk when we have real payload (use stats)
+
         await this.backend.put(entry);
         return entry;
     }
@@ -968,10 +979,7 @@ class FavoriteGifCache {
         return true;
     }
 
-    /**
-     * Write media. By default will not kick anything out if full (scroll-safe).
-     * Pass allowEvict: true only when intentionally reclaiming space.
-     */
+    
     async put(
         key: string,
         data: Uint8Array,
@@ -994,8 +1002,10 @@ class FavoriteGifCache {
                 this.revokeBlob(key);
                 this.ensureBlobUrlSync(key, { bumpUsage: false });
             }
-            // Soft unload may have dropped other payloads — drop their blob URLs too
+
+            const pinned = new Set(this.core.getDisplayPinnedKeys());
             for (const k of [...this.blobUrls.keys()]) {
+                if (pinned.has(k)) continue;
                 if (!this.core.hasResidentData(k)) this.revokeBlob(k);
             }
         }
@@ -1013,10 +1023,7 @@ class FavoriteGifCache {
         return ok;
     }
 
-    /**
-     * Drop keys that are no longer favorites. Frees slots without thrashing still-favorited media.
-     * Does not wipe the whole cache.
-     */
+    
     async pruneNotIn(keepKeys: Iterable<string>) {
         await this.init();
         const keep = new Set(keepKeys);
@@ -1052,7 +1059,6 @@ class FavoriteGifCache {
             return existing;
         }
 
-        // Payload soft-unloaded — caller should hydrate async; do not mint empty blobs
         if (this.core.needsHydrate(key)) return null;
 
         const entry = bump ? this.core.get(key) : this.core.peek(key);
@@ -1060,17 +1066,25 @@ class FavoriteGifCache {
         if (bump) this.scheduleMetaPersist(entry);
 
         try {
+
             const copy = entry.data.slice();
-            const blob = new Blob([copy], { type: entry.mimeType || "image/gif" });
+            const ab = copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength);
+            const mime = sniffMime(copy, entry.mimeType || "application/octet-stream");
+            const blob = new Blob([ab], { type: mime || "application/octet-stream" });
+            if (blob.size <= 0) return null;
             const url = URL.createObjectURL(blob);
             this.blobUrls.set(key, url);
+
+            if (mime && mime !== entry.mimeType) {
+                entry.mimeType = mime;
+            }
             return url;
         } catch {
             return null;
         }
     }
 
-    /** Hydrate from disk if needed, then create blob URL. */
+    
     async ensureBlobUrl(key: string, opts: BlobUrlOptions = {}): Promise<string | null> {
         await this.init();
         if (this.core.needsHydrate(key)) {
@@ -1080,33 +1094,40 @@ class FavoriteGifCache {
     }
 
     resolveDisplayUrlSync(remoteUrl: string): string | null {
+        const hit = this.resolveDisplayHitSync(remoteUrl);
+        return hit?.blobUrl ?? null;
+    }
+
+    
+    resolveDisplayHitSync(remoteUrl: string, opts: BlobUrlOptions = {}): { blobUrl: string; mimeType?: string; key: string; } | null {
         if (!remoteUrl || remoteUrl.startsWith("blob:") || remoteUrl.startsWith("data:")) {
-            return remoteUrl || null;
+            return null;
         }
 
-        // Tenor + Klipy rewrites so a favorite still shows if stored under either host
+        const bump = opts.bumpUsage !== false;
         const candidates = mediaLookupKeys(remoteUrl);
 
         for (const key of candidates) {
             const hot = this.blobUrls.get(key);
             if (hot) {
-                this.touchSync(key);
-                return hot;
+                if (bump) this.touchSync(key);
+                const meta = this.core.getMeta(key);
+                return { blobUrl: hot, mimeType: meta?.mimeType, key };
             }
         }
 
         for (const key of candidates) {
-            const created = this.ensureBlobUrlSync(key, { bumpUsage: true });
-            if (created) return created;
+            const created = this.ensureBlobUrlSync(key, { bumpUsage: bump });
+            if (created) {
+                const meta = this.core.getMeta(key);
+                return { blobUrl: created, mimeType: meta?.mimeType, key };
+            }
         }
 
         return null;
     }
 
-    /**
-     * Create blob URLs for keys that already have resident data.
-     * Does not hydrate the entire cache (that would OOM). Pass only the visible set.
-     */
+    
     warmAllBlobUrls(keys?: string[]) {
         const list = keys ?? this.core.keys();
         let n = 0;
@@ -1125,8 +1146,17 @@ class FavoriteGifCache {
         return this.blobUrls.get(key);
     }
 
+    
+    isLiveBlobUrl(blobUrl: string) {
+        if (!blobUrl || !blobUrl.startsWith("blob:")) return false;
+        for (const u of this.blobUrls.values()) {
+            if (u === blobUrl) return true;
+        }
+        return false;
+    }
+
     private scheduleMetaPersist(entry: CacheEntry) {
-        // Never persist a soft-unloaded shell (empty data) over the real disk bytes
+
         if (entry.data.byteLength === 0 && entry.size > 0) return;
 
         const prev = this.metaPersistQueue.get(entry.key);
@@ -1147,7 +1177,7 @@ class FavoriteGifCache {
             try {
                 URL.revokeObjectURL(url);
             } catch {
-                // ignore
+
             }
         }
         this.blobUrls.delete(key);
@@ -1174,7 +1204,7 @@ interface FavoriteGifRef {
     width?: number;
     height?: number;
     format?: number;
-    /** Discord favorite order — higher usually means newer / more recent. */
+    
     order?: number;
 }
 
@@ -1186,12 +1216,11 @@ function getWebpackFind(): WebpackFind | null {
             ?? (globalThis as any).Equicord?.Webpack?.find;
         if (typeof w === "function") return w;
     } catch {
-        // ignore
+
     }
     return null;
 }
 
-/** Pull favorite gif urls from Discord's frecency settings blob. */
 function getFavoriteGifRefsFromFrecency(): FavoriteGifRef[] {
     try {
         const find = getWebpackFind();
@@ -1227,26 +1256,20 @@ function getFavoriteGifRefsFromFrecency(): FavoriteGifRef[] {
     }
 }
 
-/** Newest first (higher `order` first). Missing order sorts last. */
 function sortFavoritesNewestFirst(refs: FavoriteGifRef[]): FavoriteGifRef[] {
     return [...refs].sort((a, b) => {
         const ao = typeof a.order === "number" ? a.order : Number.NEGATIVE_INFINITY;
         const bo = typeof b.order === "number" ? b.order : Number.NEGATIVE_INFINITY;
         if (bo !== ao) return bo - ao;
-        // stable-ish fallback: url string so sort is deterministic
+
         const au = a.src || a.url || "";
         const bu = b.src || b.url || "";
         return bu < au ? -1 : bu > au ? 1 : 0;
     });
 }
 
-/** How many newest favorites to mint blob URLs for after prefetch (not the whole 1/3 fill). */
 const PREFETCH_WARM_NEWEST = 16;
 
-/**
- * Startup prefetch byte budget: 1/3 of max cache size (e.g. 500 MB → ~167 MB).
- * Bytes go to disk; soft RAM budget keeps the renderer heap safe.
- */
 function prefetchTargetBytes(maxBytes: number): number {
     if (!Number.isFinite(maxBytes) || maxBytes <= 0) return 0;
     return Math.max(1, Math.floor(maxBytes / 3));
@@ -1288,10 +1311,6 @@ function isLikelyGifMediaUrl(url: string) {
     }
 }
 
-/**
- * URL looks like an explicit video file.
- * Small Tenor/Klipy mp4 "gifs" may still be cached if under the per-file size cap in media.ts.
- */
 function isHeavyVideoUrl(url: string) {
     if (!url || typeof url !== "string") return false;
     if (url.startsWith("blob:") || url.startsWith("data:")) return false;
@@ -1309,9 +1328,103 @@ function isHeavyVideoMime(mime: string | null | undefined) {
     return m.startsWith("video/") || m === "application/mp4";
 }
 
-/** URL is a candidate for the favorite cache (size limits applied at download time). */
 function isCacheableFavoriteUrl(url: string) {
     return isLikelyGifMediaUrl(url);
+}
+
+const GIF_FORMAT_IMAGE = 1;
+const GIF_FORMAT_VIDEO = 2;
+
+function isBlobOrDataUrl(url: unknown): url is string {
+    return typeof url === "string" && (url.startsWith("blob:") || url.startsWith("data:"));
+}
+
+function isRemoteHttpUrl(url: unknown): url is string {
+    return typeof url === "string" && (url.startsWith("http://") || url.startsWith("https://"));
+}
+
+function isVideoMime(mime: string | null | undefined): boolean {
+    if (!mime) return false;
+    const m = mime.toLowerCase().split(";")[0]!.trim();
+    return m.startsWith("video/") || m === "application/mp4";
+}
+
+function isImageMime(mime: string | null | undefined): boolean {
+    if (!mime) return false;
+    const m = mime.toLowerCase().split(";")[0]!.trim();
+    return m.startsWith("image/");
+}
+
+function mimeMatchesFormat(format: number | undefined, mime: string | null | undefined): boolean {
+    const f = typeof format === "number" ? format : GIF_FORMAT_IMAGE;
+    if (f === GIF_FORMAT_VIDEO) return isVideoMime(mime);
+    if (isVideoMime(mime)) return false;
+    if (!mime || mime === "application/octet-stream") return true;
+    return isImageMime(mime);
+}
+
+function stashOriginalUrls(gif: any): void {
+    if (!gif || typeof gif !== "object") return;
+
+    if (!isRemoteHttpUrl(gif.__fgcOriginalSrc)) {
+        if (isRemoteHttpUrl(gif.src)) gif.__fgcOriginalSrc = gif.src;
+        else if (isRemoteHttpUrl(gif.url)) gif.__fgcOriginalSrc = gif.url;
+    }
+
+    if (!isRemoteHttpUrl(gif.__fgcOriginalUrl)) {
+        if (isRemoteHttpUrl(gif.url)) gif.__fgcOriginalUrl = gif.url;
+        else if (isRemoteHttpUrl(gif.src)) gif.__fgcOriginalUrl = gif.src;
+    }
+
+    if (typeof gif.__fgcOriginalFormat !== "number" && typeof gif.format === "number") {
+        gif.__fgcOriginalFormat = gif.format;
+    }
+}
+
+function remoteSendUrl(gif: any): string | null {
+    if (!gif || typeof gif !== "object") return null;
+    for (const c of [
+        gif.__fgcOriginalUrl,
+        gif.__fgcOriginalSrc,
+        isBlobOrDataUrl(gif.url) ? null : gif.url,
+        isBlobOrDataUrl(gif.src) ? null : gif.src,
+    ]) {
+        if (isRemoteHttpUrl(c)) return c;
+    }
+    return null;
+}
+
+function remoteDisplaySrc(gif: any): string {
+    if (!gif || typeof gif !== "object") return "";
+    for (const c of [
+        gif.__fgcOriginalSrc,
+        gif.__fgcOriginalUrl,
+        isBlobOrDataUrl(gif.src) ? null : gif.src,
+        isBlobOrDataUrl(gif.url) ? null : gif.url,
+    ]) {
+        if (isRemoteHttpUrl(c)) return c;
+    }
+    return "";
+}
+
+function favoriteStableKey(gif: any): string {
+    if (!gif || typeof gif !== "object") return "";
+    return remoteSendUrl(gif) || remoteDisplaySrc(gif) || "";
+}
+
+function restoreUrlsForSend(gif: any): void {
+    if (!gif || typeof gif !== "object") return;
+    stashOriginalUrls(gif);
+    const sendUrl = remoteSendUrl(gif);
+    const displaySrc = remoteDisplaySrc(gif) || sendUrl;
+    if (sendUrl) gif.url = sendUrl;
+    if (displaySrc) gif.src = displaySrc;
+    if (typeof gif.__fgcOriginalFormat === "number") gif.format = gif.__fgcOriginalFormat;
+}
+
+function healFavoriteUrls(gif: any): void {
+    if (!gif || typeof gif !== "object") return;
+    if (isBlobOrDataUrl(gif.src) || isBlobOrDataUrl(gif.url)) restoreUrlsForSend(gif);
 }
 
 const STORE_KEY = "FavoriteGifCache.autoCacheDenylist";
@@ -1346,13 +1459,11 @@ function isAutoCacheDenied(url: string) {
     return false;
 }
 
-/** Block auto/prefetch/scroll caching until user manually caches again. */
 async function denyAutoCache(url: string) {
     for (const k of keysFor(url)) denied.add(k);
     await persist();
 }
 
-/** Allow auto-cache again (and used when user clicks Cache GIF). */
 async function allowAutoCache(url: string) {
     for (const k of keysFor(url)) denied.delete(k);
     await persist();
@@ -1368,7 +1479,6 @@ function isDenylistLoaded() {
 
 type Native = PluginNative<typeof import("./native")>;
 
-/** Plugin helpers are keyed by definePlugin name and sometimes folder name. */
 function getPluginNative(): Native | null {
     try {
         const helpers =
@@ -1379,7 +1489,6 @@ function getPluginNative(): Native | null {
 
         if (!helpers || typeof helpers !== "object") return null;
 
-        // Keyed by definePlugin({ name }) — see other plugins (OpenInApp, FileUpload, …)
         const n =
             helpers.FavoriteGifCache
             ?? helpers.favoriteGifCache
@@ -1398,10 +1507,14 @@ function hasFileNative() {
 
 const inflight = new Map<string, Promise<{ data: Uint8Array; mime: string; } | null>>();
 
-/** Skip single files bigger than this (huge "gif" mp4s). */
 const MAX_ENTRY_BYTES = 12 * 1024 * 1024;
 
-function guessMime(url: string, contentType: string | null) {
+function guessMime(url: string, contentType: string | null, data?: Uint8Array) {
+
+    if (data && data.byteLength >= 4) {
+        const sniffed = sniffMime(data, "");
+        if (sniffed) return sniffed;
+    }
     if (contentType && !contentType.includes("octet-stream")) {
         return contentType.split(";")[0]!.trim();
     }
@@ -1415,9 +1528,6 @@ function guessMime(url: string, contentType: string | null) {
     return "image/gif";
 }
 
-/**
- * Try a single media URL once (native preferred, then optional renderer fetch).
- */
 async function downloadOneUrl(
     url: string,
     fetchImpl: typeof fetch,
@@ -1434,15 +1544,14 @@ async function downloadOneUrl(
                 if (data.byteLength && data.byteLength <= maxBytes) {
                     return {
                         data,
-                        mime: guessMime(url, res.type || null),
+                        mime: guessMime(url, res.type || null, data),
                     };
                 }
             }
         } catch {
-            // try next strategy / candidate
+
         }
-        // native available but this URL failed — try next candidate (e.g. Klipy fallback)
-        // still allow renderer only when no native at all (below)
+
         return null;
     }
 
@@ -1453,19 +1562,15 @@ async function downloadOneUrl(
             mode: "cors",
         } as RequestInit);
         if (!res.ok) return null;
-        const mime = guessMime(url, res.headers.get("content-type"));
         const buf = new Uint8Array(await res.arrayBuffer());
         if (!buf.byteLength || buf.byteLength > maxBytes) return null;
+        const mime = guessMime(url, res.headers.get("content-type"), buf);
         return { data: buf, mime };
     } catch {
         return null;
     }
 }
 
-/**
- * Pull bytes for a favorite media URL.
- * Prefers native (main process). On Tenor failure, tries Klipy host-swap candidates.
- */
 async function downloadFavoriteMedia(
     url: string,
     fetchImpl: typeof fetch = fetch,
@@ -1482,8 +1587,6 @@ async function downloadFavoriteMedia(
 async function getCachedBytes(cache: FavoriteGifCache, url: string) {
     await cache.init();
 
-    // peek first so miss path does not thrash metadata writes
-    // also check Klipy rewrites of Tenor so a fallback store still hits
     for (const key of mediaLookupKeys(url)) {
         if (!cache.has(key)) continue;
         if (!cache.hasResidentData(key)) {
@@ -1503,16 +1606,12 @@ type EnsureCachedOptions = {
     fetchImpl?: typeof fetch;
     allowEvict?: boolean;
     maxBytes?: number;
-    /** Ignore denylist (manual "Cache GIF" action). */
+    
     force?: boolean;
-    /** Called to check auto-cache denylist. */
+    
     isDenied?: (url: string) => boolean;
 };
 
-/**
- * Hit → local bytes.
- * Miss → download once (native preferred), store if under size/cap rules.
- */
 async function ensureCached(
     cache: FavoriteGifCache,
     url: string,
@@ -1553,15 +1652,12 @@ async function ensureCached(
     const downloaded = await pending;
     if (!downloaded) return null;
 
-    // Skip only truly huge videos; normal Tenor/Klipy "gif" mp4s under the cap are OK
     if (downloaded.data.byteLength > maxBytes) {
         return null;
     }
 
-    // Always store under the original favorite key so Discord's Tenor URL still resolves
     await cache.put(key, downloaded.data, downloaded.mime, { allowEvict });
 
-    // Also index under the successful Klipy (or other) URL when fallback was used
     const fromKey = downloaded.fromUrl ? cacheKeyForUrl(downloaded.fromUrl) : null;
     if (fromKey && fromKey !== key) {
         await cache.put(fromKey, downloaded.data, downloaded.mime, { allowEvict: false });
@@ -1601,95 +1697,6 @@ async function cacheOnUserAction(
     });
 }
 
-async function resolveDisplayUrl(
-    cache: FavoriteGifCache,
-    originalUrl: string,
-    opts: { awaitMiss?: boolean; fetchImpl?: typeof fetch; allowEvict?: boolean } = {},
-) {
-    if (!originalUrl || originalUrl.startsWith("blob:") || originalUrl.startsWith("data:")) {
-        return originalUrl;
-    }
-
-    const hot = cache.getCachedBlobUrl(cacheKeyForUrl(originalUrl))
-        ?? cache.getCachedBlobUrl(originalUrl);
-    if (hot) {
-        cache.touchSync(cacheKeyForUrl(originalUrl));
-        return hot;
-    }
-
-    const blob = await cache.getBlobUrl(cacheKeyForUrl(originalUrl));
-    if (blob) return blob;
-    if (originalUrl !== cacheKeyForUrl(originalUrl)) {
-        const blob2 = await cache.getBlobUrl(originalUrl);
-        if (blob2) return blob2;
-    }
-
-    const run = async () => {
-        const ensured = await ensureCached(cache, originalUrl, {
-            fetchImpl: opts.fetchImpl ?? fetch,
-            allowEvict: opts.allowEvict,
-        });
-        if (!ensured) return originalUrl;
-        if (ensured.stored) {
-            const b = await cache.getBlobUrl(ensured.key);
-            return b || originalUrl;
-        }
-        if (typeof Blob !== "undefined" && typeof URL !== "undefined" && URL.createObjectURL) {
-            try {
-                return URL.createObjectURL(new Blob([ensured.data], { type: ensured.mimeType }));
-            } catch {
-                return originalUrl;
-            }
-        }
-        return originalUrl;
-    };
-
-    if (opts.awaitMiss) return run();
-    void run();
-    return originalUrl;
-}
-
-function installFetchInterceptor(
-    cache: FavoriteGifCache,
-    isFavoriteUrl: (url: string) => boolean,
-) {
-    if (typeof globalThis.fetch !== "function") return () => {};
-
-    const original = globalThis.fetch.bind(globalThis);
-
-    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-        try {
-            const url = typeof input === "string"
-                ? input
-                : input instanceof URL
-                    ? input.href
-                    : (input as Request).url;
-
-            if (url && isFavoriteUrl(url)) {
-                const hit = await getCachedBytes(cache, url);
-                if (hit) {
-                    return new Response(hit.data, {
-                        status: 200,
-                        statusText: "OK",
-                        headers: {
-                            "Content-Type": hit.mimeType,
-                            "X-FavoriteGifCache": "HIT",
-                        },
-                    });
-                }
-            }
-        } catch {
-            // fall through
-        }
-        return original(input as any, init);
-    };
-
-    return () => {
-        globalThis.fetch = original;
-    };
-}
-
-/** Live cache handle for settings UI + plugin code. */
 let active: FavoriteGifCache | null = null;
 let rebuild: (() => Promise<FavoriteGifCache>) | null = null;
 
@@ -1710,27 +1717,20 @@ async function rebuildActiveCache() {
     return rebuild();
 }
 
-// component plugged in from index to avoid circular imports
 let usageComponent: (() => any) | null = null;
 
 function setUsageBarComponent(fn: () => any) {
     usageComponent = fn;
 }
 
-/** Wired from index.tsx after cache helpers exist. */
 const settingsHooks = {
     onLimitsChange: () => {},
     onSmartEvictionChange: () => {},
     onCacheDirectoryChange: () => {},
 };
 
-/** Removed options still lingering in saved settings.json from older builds. */
 const STALE_SETTING_KEYS = ["maxEntries", "showCacheBadges"] as const;
 
-/**
- * Drop dead keys from Equicord/Vencord settings so they do not stick around forever.
- * Safe to call multiple times.
- */
 function purgeStalePluginSettings() {
     try {
         const plug = Settings.plugins?.FavoriteGifCache as Record<string, unknown> | undefined;
@@ -1741,7 +1741,7 @@ function purgeStalePluginSettings() {
             }
         }
     } catch {
-        // settings not ready yet
+
     }
 }
 
@@ -1762,7 +1762,7 @@ const settings = definePluginSettings({
         description: "Don't save files bigger than 12 MB",
         default: true,
     },
-    // set via Choose folder button only
+
     cacheDirectory: {
         type: OptionType.STRING,
         description: "Cache folder",
@@ -1783,12 +1783,11 @@ const settings = definePluginSettings({
     },
     rewriteFavoriteSrc: {
         type: OptionType.BOOLEAN,
-        description: "Load cached GIFs from disk instead of the internet",
+        description: "Show cached GIFs from disk in the picker (faster)",
         default: true,
     },
 });
 
-// run as soon as the module loads (before start) so dead keys leave settings immediately
 purgeStalePluginSettings();
 
 function formatMB(bytes: number) {
@@ -1810,7 +1809,7 @@ function showToast(message: string, type: any) {
             id: Toasts.genId(),
         });
     } catch {
-        // ignore
+
     }
 }
 
@@ -1930,7 +1929,7 @@ function CacheUsageBar() {
     const onBrowse = async () => {
         const native = getPluginNative();
         if (!native?.pickCacheDirectory) {
-            showToast("Folder picker unavailable — restart Discord after updating", Toasts.Type.FAILURE);
+            showToast("Folder picker unavailable - restart Discord after updating", Toasts.Type.FAILURE);
             return;
         }
         setBusy(true);
@@ -2013,7 +2012,7 @@ function CacheUsageBar() {
                 wordBreak: "break-all",
             }}>
                 <span style={{ fontWeight: 600, color: "var(--header-secondary)" }}>Location: </span>
-                {pathLabel || "—"}
+                {pathLabel || "-"}
             </div>
 
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -2049,12 +2048,15 @@ function CacheUsageBar() {
 setUsageBarComponent(() => <CacheUsageBar />);
 
 let cache: FavoriteGifCache | null = null;
-let uninstallFetch: (() => void) | null = null;
 let favoriteUrlSet = new Set<string>();
-/** After first seed, keys that appear here are "just favorited". */
+
 let favoritesSeeded = false;
 let prefetchTimer: ReturnType<typeof setTimeout> | null = null;
 let lastPickerInstance: { forceUpdate?: () => void; dead?: boolean } | null = null;
+let wrapAsyncGeneration = 0;
+let forceUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+
+const displayViews = new Map<string, any>();
 
 function maxBytesFromSettings() {
     const mb = Number(settings.store.maxMegabytes);
@@ -2062,7 +2064,6 @@ function maxBytesFromSettings() {
     return Math.floor(mb * 1024 * 1024);
 }
 
-/** Per-file download cap; Infinity when skipLargeFiles is off. */
 function perFileMaxBytes() {
     return settings.store.skipLargeFiles === false ? Number.MAX_SAFE_INTEGER : MAX_ENTRY_BYTES;
 }
@@ -2103,9 +2104,9 @@ async function applyLimitsFromSettings() {
         await c.init();
         await c.setMaxBytes(maxBytesFromSettings());
         c.setSmartEviction(settings.store.smartEviction !== false);
-        // do not warm entire cache into RAM after settings change
+
     } catch {
-        // settings UI should still work
+
     }
 }
 
@@ -2114,16 +2115,11 @@ settingsHooks.onSmartEvictionChange = () => {
     try {
         getCache().setSmartEviction(settings.store.smartEviction !== false);
     } catch {
-        // ignore
+
     }
 };
 settingsHooks.onCacheDirectoryChange = () => { void rebuildCache(); };
 
-/**
- * Update the known favorite URL set.
- * Returns primary media URLs that are newly favorited (not present last time).
- * First call only seeds state so startup/open does not look like mass "new" favorites.
- */
 function refreshFavoriteSet(refs?: FavoriteGifRef[]): string[] {
     const list = refs ?? getFavoriteGifRefsFromFrecency();
     const next = new Set<string>();
@@ -2158,19 +2154,17 @@ function refreshFavoriteSet(refs?: FavoriteGifRef[]): string[] {
 
 function isTrackedFavorite(url: string) {
     if (!url || !isLikelyGifMediaUrl(url)) return false;
-    // Until favorites seed, do NOT treat every gif URL as favorite — that made
-    // the fetch interceptor + cache init run on every media request (crash fuel).
+
     if (!favoritesSeeded || favoriteUrlSet.size === 0) return false;
     return favoriteUrlSet.has(url) || favoriteUrlSet.has(cacheKeyForUrl(url));
 }
 
 function shouldCacheFavoriteUrl(url: string, _format?: number) {
     if (!url || url.startsWith("blob:") || url.startsWith("data:")) return false;
-    // Size filter happens at download time — don't block Tenor mp4 "gifs" by format alone
+
     return isCacheableFavoriteUrl(url) || isLikelyGifMediaUrl(url);
 }
 
-/** Prefer image-like urls when both src and url exist; otherwise first media url. */
 function pickCacheableUrl(ref: { src?: string; url?: string; format?: number; }): string | null {
     const candidates = [ref.src, ref.url].filter((u): u is string => !!u && typeof u === "string");
     const nonVideo = candidates.filter(u => shouldCacheFavoriteUrl(u) && !isHeavyVideoUrl(u));
@@ -2181,38 +2175,153 @@ function pickCacheableUrl(ref: { src?: string; url?: string; format?: number; })
     return null;
 }
 
-function originalSrc(gif: any) {
-    return gif?.__fgcOriginalSrc || gif?.src || gif?.url || "";
-}
-
-function applySyncBlobSrc(favorites: any[], c: FavoriteGifCache) {
-    if (!settings.store.rewriteFavoriteSrc) return 0;
-    let changed = 0;
-    for (const gif of favorites) {
-        if (!gif || typeof gif !== "object") continue;
-        const original = originalSrc(gif);
-        if (!original || typeof original !== "string") continue;
-        if (original.startsWith("blob:") || original.startsWith("data:")) continue;
-
-        const local = c.resolveDisplayUrlSync(original);
-        if (local && local.startsWith("blob:") && gif.src !== local) {
-            if (!gif.__fgcOriginalSrc) gif.__fgcOriginalSrc = gif.src || original;
-            if (!gif.__fgcOriginalUrl && gif.url) gif.__fgcOriginalUrl = gif.url;
-            gif.src = local;
-            changed += 1;
-        }
-    }
-    return changed;
-}
-
 function safeForceUpdate(instance: any) {
     try {
         if (instance && !instance.dead && typeof instance.forceUpdate === "function") {
             instance.forceUpdate();
         }
     } catch {
-        // picker stays usable even if forceUpdate flakes
+
     }
+}
+
+function scheduleForceUpdate(instance: any) {
+    if (forceUpdateTimer) clearTimeout(forceUpdateTimer);
+    forceUpdateTimer = setTimeout(() => {
+        forceUpdateTimer = null;
+        safeForceUpdate(instance ?? lastPickerInstance);
+    }, 48);
+}
+
+function readRemotes(storeGif: any) {
+    healFavoriteUrls(storeGif);
+    stashOriginalUrls(storeGif);
+    const src = remoteDisplaySrc(storeGif)
+        || (isRemoteHttpUrl(storeGif?.src) ? storeGif.src : "")
+        || (isRemoteHttpUrl(storeGif?.url) ? storeGif.url : "");
+    const url = remoteSendUrl(storeGif)
+        || (isRemoteHttpUrl(storeGif?.url) ? storeGif.url : "")
+        || src;
+    const format = typeof storeGif?.format === "number"
+        ? storeGif.format
+        : (typeof storeGif?.__fgcOriginalFormat === "number" ? storeGif.__fgcOriginalFormat : undefined);
+    return { src, url, format };
+}
+
+function getStableDisplayGif(storeGif: any, c: FavoriteGifCache | null): any {
+    if (!storeGif || typeof storeGif !== "object") return storeGif;
+
+    const { src: remoteSrc, url: remoteUrl, format } = readRemotes(storeGif);
+    const key = remoteUrl || remoteSrc;
+    if (!key) {
+        healFavoriteUrls(storeGif);
+        return storeGif;
+    }
+
+    const cdnSrc = remoteSrc || remoteUrl;
+    const cdnUrl = remoteUrl || remoteSrc;
+
+    let view = displayViews.get(key);
+    if (!view) {
+        view = { ...storeGif };
+        view.__fgcOriginalSrc = cdnSrc;
+        view.__fgcOriginalUrl = cdnUrl;
+        if (typeof format === "number") {
+            view.__fgcOriginalFormat = format;
+            view.format = format;
+        }
+        view.src = cdnSrc;
+        view.url = cdnUrl;
+        displayViews.set(key, view);
+    } else {
+        if (cdnSrc) view.__fgcOriginalSrc = cdnSrc;
+        if (cdnUrl) view.__fgcOriginalUrl = cdnUrl;
+        if (typeof format === "number") {
+            view.__fgcOriginalFormat = format;
+            view.format = format;
+        } else if (typeof view.__fgcOriginalFormat === "number") {
+            view.format = view.__fgcOriginalFormat;
+        }
+        if (storeGif.width != null) view.width = storeGif.width;
+        if (storeGif.height != null) view.height = storeGif.height;
+        if (storeGif.order != null) view.order = storeGif.order;
+        view.url = view.__fgcOriginalUrl || cdnUrl;
+    }
+
+    const srcNow = view.src;
+    if (!srcNow || isBlobOrDataUrl(srcNow)) {
+        const live = c && isBlobOrDataUrl(srcNow) && c.isInitialized() && c.isLiveBlobUrl(srcNow);
+        if (!live) view.src = view.__fgcOriginalSrc || view.__fgcOriginalUrl || cdnSrc;
+    } else if (!isRemoteHttpUrl(srcNow)) {
+        view.src = view.__fgcOriginalSrc || view.__fgcOriginalUrl || cdnSrc;
+    }
+
+    return view;
+}
+
+function displayCandidateUrls(view: any): string[] {
+    const src = view.__fgcOriginalSrc || "";
+    const url = view.__fgcOriginalUrl || "";
+    const format = typeof view.__fgcOriginalFormat === "number" ? view.__fgcOriginalFormat : view.format;
+    const out: string[] = [];
+    const push = (u: string) => {
+        if (u && isRemoteHttpUrl(u) && !out.includes(u)) out.push(u);
+    };
+    if (format === GIF_FORMAT_VIDEO) {
+        if (isHeavyVideoUrl(src)) push(src);
+        if (isHeavyVideoUrl(url)) push(url);
+    } else {
+        if (src && !isHeavyVideoUrl(src)) push(src);
+        if (url && !isHeavyVideoUrl(url)) push(url);
+    }
+    push(src);
+    push(url);
+    return out;
+}
+
+function paintCachedSrc(view: any, c: FavoriteGifCache): boolean {
+    const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
+    const send = view.__fgcOriginalUrl || cdn;
+    let changed = false;
+
+    if (send && view.url !== send) {
+        view.url = send;
+        changed = true;
+    }
+    if (typeof view.__fgcOriginalFormat === "number" && view.format !== view.__fgcOriginalFormat) {
+        view.format = view.__fgcOriginalFormat;
+        changed = true;
+    }
+
+    if (!settings.store.rewriteFavoriteSrc) {
+        if (cdn && view.src !== cdn) {
+            view.src = cdn;
+            changed = true;
+        }
+        return changed;
+    }
+
+    const format = typeof view.__fgcOriginalFormat === "number"
+        ? view.__fgcOriginalFormat
+        : (typeof view.format === "number" ? view.format : 1);
+
+    for (const remote of displayCandidateUrls(view)) {
+        const hit = c.resolveDisplayHitSync(remote, { bumpUsage: false });
+        if (!hit?.blobUrl?.startsWith("blob:")) continue;
+        if (!mimeMatchesFormat(format, hit.mimeType)) continue;
+        if (!c.isLiveBlobUrl(hit.blobUrl)) continue;
+        if (view.src !== hit.blobUrl) {
+            view.src = hit.blobUrl;
+            changed = true;
+        }
+        return changed;
+    }
+
+    if (cdn && view.src !== cdn) {
+        view.src = cdn;
+        changed = true;
+    }
+    return changed;
 }
 
 async function applyMaxFromSettings() {
@@ -2223,28 +2332,19 @@ function toast(message: string, type: any) {
     try {
         Toasts.show({ message, type, id: Toasts.genId() });
     } catch {
-        // ignore
+
     }
 }
 
 function resolveItemUrl(item: any): string | null {
     if (!item) return null;
-    // Prefer originals we stashed when rewriting to blob: — context menu must not use blob URLs
-    const src = typeof item.__fgcOriginalSrc === "string" && item.__fgcOriginalSrc
-        ? item.__fgcOriginalSrc
-        : (typeof item.src === "string" && !item.src.startsWith("blob:") && !item.src.startsWith("data:")
-            ? item.src
-            : undefined);
-    const url = typeof item.__fgcOriginalUrl === "string" && item.__fgcOriginalUrl
-        ? item.__fgcOriginalUrl
-        : (typeof item.url === "string" && !item.url.startsWith("blob:") && !item.url.startsWith("data:")
-            ? item.url
-            : undefined);
-
+    stashOriginalUrls(item);
+    const src = remoteDisplaySrc(item) || undefined;
+    const url = remoteSendUrl(item) || undefined;
     const picked = pickCacheableUrl({ src, url, format: item.format });
     if (picked) return picked;
-    if (src) return src;
     if (url) return url;
+    if (src) return src;
     return null;
 }
 
@@ -2267,13 +2367,14 @@ async function manualCacheGif(url: string) {
     await allowAutoCache(url);
     const c = getCache();
     await c.init();
+
     const res = await cacheOnUserAction(c, url, fetch, {
         force: true,
-        maxBytes: perFileMaxBytes(),
+        maxBytes: Number.MAX_SAFE_INTEGER,
     });
     if (res?.stored || c.has(cacheKeyForUrl(url))) {
         c.ensureBlobUrlSync(cacheKeyForUrl(url), { bumpUsage: true });
-        toast("GIF cached", Toasts.Type.SUCCESS);
+        toast("GIF Cached", Toasts.Type.SUCCESS);
         safeForceUpdate(lastPickerInstance);
     } else {
         toast("Could not cache GIF", Toasts.Type.FAILURE);
@@ -2287,22 +2388,17 @@ async function manualRemoveFromCache(url: string) {
     await c.delete(key);
     if (key !== url) await c.delete(url);
     await denyAutoCache(url);
-    toast("Removed from cache — won't auto-cache again", Toasts.Type.SUCCESS);
+    toast("GIF Removed From Cache", Toasts.Type.SUCCESS);
     safeForceUpdate(lastPickerInstance);
 }
 
-/**
- * Startup auto-download:
- * newest first until cache catalog hits 1/3 of max size (e.g. 500 MB → ~167 MB on disk).
- * Never evicts. Does not keep ~167 MB of blob URLs in RAM — soft memory + warm only newest slice.
- */
 async function prefetchFavorites() {
     try {
         const c = getCache();
         await c.init();
         refreshFavoriteSet();
         let refs = getFavoriteGifRefsFromFrecency();
-        // Frecency can be empty early in boot — retry once
+
         if (!refs.length) {
             await new Promise(r => setTimeout(r, 2000));
             refs = getFavoriteGifRefsFromFrecency();
@@ -2327,18 +2423,16 @@ async function prefetchFavorites() {
                 try {
                     await c.ensureBlobUrl(cacheKeyForUrl(url), { bumpUsage: false });
                 } catch {
-                    // ignore
+
                 }
             }
         };
 
-        // Already at / over 1/3 capacity — only warm a small newest slice
         if (c.bytes() >= targetBytes) {
             await warmNewest();
             return;
         }
 
-        // Disk-first fill to 1/3. Soft RAM unload runs inside put; no per-file blob mint.
         let steps = 0;
         for (const url of queue) {
             if (c.bytes() >= targetBytes) break;
@@ -2346,19 +2440,19 @@ async function prefetchFavorites() {
                 const key = cacheKeyForUrl(url);
                 if (c.has(key) || c.has(url)) continue;
                 await ensureCached(c, url, { allowEvict: false, ...autoCacheOpts() });
-                // yield so Discord UI / input stay responsive during a long 1/3 fill
+
                 steps += 1;
                 if (steps % 2 === 0) {
                     await new Promise(r => setTimeout(r, 0));
                 }
             } catch {
-                // skip bad urls
+
             }
         }
 
         await warmNewest();
     } catch {
-        // never take discord down
+
     }
 }
 
@@ -2367,7 +2461,6 @@ export default definePlugin({
     description: "Caches GIF picker favorites on disk so they load from local storage instead of re-downloading",
     authors: [{ name: "Arad", id: 825757055981846560n }],
     tags: ["GIF", "Media", "Performance"],
-    // ExtraContextMenusAPI (required Equicord API) wires gifPickerContextMenu
 
     settings,
 
@@ -2376,12 +2469,12 @@ export default definePlugin({
             find: "renderHeaderContent()",
             replacement: [
                 {
-                    // plain favorites: ...
+
                     match: /(,suggestions:\i,favorites:)(\i),/,
                     replace: "$1$self.wrapFavorites(this,$2),",
                 },
                 {
-                    // after FavoriteGifSearch: favorites:$self.getFav(x),
+
                     match: /(,suggestions:\i,favorites:)(\i\.getFav\(\i\)),/,
                     replace: "$1$self.wrapFavorites(this,$2),",
                 },
@@ -2396,16 +2489,13 @@ export default definePlugin({
         },
     ],
 
-    /**
-     * Right-click on GIF in picker (ExtraContextMenusAPI wires this in).
-     * Signature matches GifPickerContextMenuItemFactory: (instance, event).
-     */
+    
     gifPickerContextMenu(instance: any, _e?: any) {
         try {
             const item = instance?.props?.item ?? instance?.props;
             const url = resolveItemUrl(item);
             if (!url) return null;
-            // allow any remote media URL from the picker, not only known hosts
+
             if (url.startsWith("blob:") || url.startsWith("data:")) return null;
 
             const cached = isLocallyCached(url);
@@ -2433,25 +2523,21 @@ export default definePlugin({
         }
     },
 
-    /**
-     * User clicked a GIF to send. If it is a favorite and not cached yet,
-     * store it (may evict least-used when full).
-     */
+    
     onSelectGif(gif?: { url?: string; src?: string; format?: number; __fgcOriginalSrc?: string; __fgcOriginalUrl?: string; }) {
         try {
             if (!gif) return;
+
+            restoreUrlsForSend(gif);
+
             const remote = pickCacheableUrl({
-                src: gif.__fgcOriginalSrc
-                    || (typeof gif.src === "string" && !gif.src.startsWith("blob:") ? gif.src : "")
-                    || undefined,
-                url: gif.__fgcOriginalUrl
-                    || (typeof gif.url === "string" && !gif.url.startsWith("blob:") ? gif.url : "")
-                    || undefined,
+                src: remoteDisplaySrc(gif) || undefined,
+                url: remoteSendUrl(gif) || undefined,
                 format: gif.format,
             });
             if (!remote) return;
-            if (!isTrackedFavorite(remote) && !isTrackedFavorite(gif.url || "") && !isTrackedFavorite(gif.src || "")) {
-                // still cache if it looks like a favorite media host from picker
+            if (!isTrackedFavorite(remote) && !isTrackedFavorite(remoteSendUrl(gif) || "") && !isTrackedFavorite(remoteDisplaySrc(gif) || "")) {
+
                 if (!isLikelyGifMediaUrl(remote)) return;
             }
 
@@ -2470,11 +2556,11 @@ export default definePlugin({
                     await cacheOnUserAction(c, remote, fetch, autoCacheOpts());
                     c.ensureBlobUrlSync(cacheKeyForUrl(remote), { bumpUsage: true });
                 } catch {
-                    // send still works without cache
+
                 }
             })();
         } catch {
-            // ignore
+
         }
     },
 
@@ -2483,116 +2569,145 @@ export default definePlugin({
             if (!Array.isArray(favorites)) return favorites;
             if (instance && typeof instance === "object") lastPickerInstance = instance;
 
-            const refs: FavoriteGifRef[] = favorites
-                .map((g: any) => ({
-                    url: g?.url || g?.src || "",
-                    src: g?.src || g?.url || "",
+            if (favorites.length === 0) return favorites;
+
+            const c = getCache();
+
+            for (const g of favorites) healFavoriteUrls(g);
+            const view = favorites.map(g => getStableDisplayGif(g, c.isInitialized() ? c : null));
+
+            if (view.length !== favorites.length) return favorites;
+
+            const live = new Set<string>();
+            for (const v of view) {
+                const k = v?.__fgcOriginalUrl || v?.__fgcOriginalSrc || favoriteStableKey(v);
+                if (k) live.add(k);
+            }
+            for (const k of [...displayViews.keys()]) {
+                if (!live.has(k)) displayViews.delete(k);
+            }
+
+            const refs: FavoriteGifRef[] = [];
+            for (const g of view) {
+                const url = g?.__fgcOriginalUrl || remoteSendUrl(g) || "";
+                const src = g?.__fgcOriginalSrc || remoteDisplaySrc(g) || "";
+                if (!url && !src) continue;
+                refs.push({
+                    url,
+                    src,
                     width: g?.width,
                     height: g?.height,
-                    format: g?.format,
+                    format: typeof g?.__fgcOriginalFormat === "number" ? g.__fgcOriginalFormat : g?.format,
                     order: g?.order,
-                }))
-                .filter(r => r.url || r.src);
+                });
+            }
 
             const newlyFavorited = refreshFavoriteSet(refs);
-            const c = getCache();
-            applySyncBlobSrc(favorites, c);
 
+            const visibleKeys: string[] = [];
+            const seen = new Set<string>();
+            for (const ref of refs) {
+                for (const u of [ref.src, ref.url, pickCacheableUrl(ref)]) {
+                    if (!u) continue;
+                    const key = cacheKeyForUrl(u);
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    visibleKeys.push(key);
+                }
+            }
+            c.setDisplayPinnedKeys(visibleKeys);
+
+            if (c.isInitialized()) {
+                for (const v of view) paintCachedSrc(v, c);
+            }
+
+            const gen = ++wrapAsyncGeneration;
             void (async () => {
                 try {
                     await c.init();
-                    // Only warm keys for THIS visible list — never the whole disk cache
-                    const visibleKeys: string[] = [];
-                    for (const ref of refs) {
-                        const u = pickCacheableUrl(ref);
-                        if (!u) continue;
-                        visibleKeys.push(cacheKeyForUrl(u));
-                    }
-                    // hydrate a few visible entries that are on disk but not in RAM
-                    let hydrateBudget = 12;
-                    for (const key of visibleKeys) {
-                        if (hydrateBudget <= 0) break;
-                        if (c.has(key) && !c.hasResidentData(key)) {
-                            await c.hydrate(key);
-                            hydrateBudget -= 1;
-                        }
-                    }
-                    c.warmAllBlobUrls(visibleKeys);
-                    let changed = applySyncBlobSrc(favorites, c) > 0;
+                    if (gen !== wrapAsyncGeneration) return;
+                    c.setDisplayPinnedKeys(visibleKeys);
 
-                    // Brand-new favorites may steal space from least-used when full
+                    for (const key of visibleKeys) {
+                        if (c.has(key) && !c.hasResidentData(key)) await c.hydrate(key);
+                        if (c.hasResidentData(key)) c.ensureBlobUrlSync(key, { bumpUsage: false });
+                        if (gen !== wrapAsyncGeneration) return;
+                    }
+
+                    let changed = false;
+                    for (const v of view) {
+                        if (paintCachedSrc(v, c)) changed = true;
+                    }
+
                     for (const u of newlyFavorited) {
                         const cacheUrl = pickCacheableUrl({ src: u, url: u });
                         if (!cacheUrl || isAutoCacheDenied(cacheUrl)) continue;
                         try {
                             await cacheOnUserAction(c, cacheUrl, fetch, autoCacheOpts());
-                            const key = cacheKeyForUrl(cacheUrl);
-                            await c.ensureBlobUrl(key, { bumpUsage: false });
-                        } catch {
-                            // ignore single failures
-                        }
+                            await c.ensureBlobUrl(cacheKeyForUrl(cacheUrl), { bumpUsage: false });
+                        } catch {  }
+                        if (gen !== wrapAsyncGeneration) return;
                     }
 
-                    // Scroll fill: tiny budget so opening the picker cannot download 500MB
-                    let scrollDownloads = 0;
-                    const SCROLL_DOWNLOAD_BUDGET = 3;
-
+                    let downloads = 0;
                     for (const ref of refs) {
-                        const u = pickCacheableUrl(ref);
-                        if (!u || isAutoCacheDenied(u)) continue;
-                        const key = cacheKeyForUrl(u);
-
-                        if (!c.has(key) && !c.has(u) && scrollDownloads < SCROLL_DOWNLOAD_BUDGET) {
-                            await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
-                            scrollDownloads += 1;
-                        }
-
-                        const blob = await c.ensureBlobUrl(key, { bumpUsage: false })
-                            || await c.ensureBlobUrl(u, { bumpUsage: false });
-                        if (!blob) continue;
-
-                        for (const gif of favorites) {
-                            const orig = originalSrc(gif);
-                            if (!orig || orig.startsWith("blob:")) continue;
-                            if (cacheKeyForUrl(orig) === key || orig === u || orig === key) {
-                                if (gif.src !== blob) {
-                                    if (!gif.__fgcOriginalSrc) gif.__fgcOriginalSrc = gif.src || orig;
-                                    if (!gif.__fgcOriginalUrl && gif.url) gif.__fgcOriginalUrl = gif.url;
-                                    gif.src = blob;
-                                    // some builds read .url for the media element
-                                    if (typeof gif.url === "string" && !gif.url.startsWith("blob:")) {
-                                        gif.url = blob;
-                                    }
-                                    c.touchSync(key) || c.touchSync(u);
-                                    changed = true;
-                                }
+                        if (downloads >= 10) break;
+                        for (const u of displayCandidateUrls({
+                            __fgcOriginalSrc: ref.src,
+                            __fgcOriginalUrl: ref.url,
+                            __fgcOriginalFormat: ref.format,
+                            format: ref.format,
+                        })) {
+                            if (isAutoCacheDenied(u)) continue;
+                            const key = cacheKeyForUrl(u);
+                            if (!c.has(key) && !c.has(u) && downloads < 10) {
+                                await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
+                                downloads += 1;
+                            }
+                            if (c.has(key) || c.has(u)) {
+                                await c.ensureBlobUrl(key, { bumpUsage: false });
                             }
                         }
+                        if (gen !== wrapAsyncGeneration) return;
                     }
 
-                    if (changed) safeForceUpdate(instance ?? lastPickerInstance);
+                    for (const v of view) {
+                        if (paintCachedSrc(v, c)) changed = true;
+                    }
+                    if (changed) scheduleForceUpdate(instance);
                 } catch {
-                    // ignore
+
                 }
             })();
+
+            return view;
         } catch {
-            // ignore
+            return favorites;
         }
-        return favorites;
     },
 
     async start() {
         try {
-            // strip removed options (maxEntries, showCacheBadges, …) from saved settings
             purgeStalePluginSettings();
+
+            try {
+                if (settings.store.rewriteFavoriteSrc !== true) {
+                    settings.store.rewriteFavoriteSrc = true;
+                }
+            } catch {
+
+            }
             await loadDenylist();
-            // loads IndexedDB from last session — does not wipe on restart
             await applyMaxFromSettings();
+
+            try {
+                await getCache().init();
+            } catch {
+
+            }
             refreshFavoriteSet();
-            uninstallFetch = installFetchInterceptor(getCache(), isTrackedFavorite);
 
             if (settings.store.prefetchOnStart) {
-                // sooner + one backup pass so boot races with Frecency still fill the cache
                 prefetchTimer = setTimeout(() => {
                     void prefetchFavorites().then(() => {
                         setTimeout(() => void prefetchFavorites(), 8000);
@@ -2605,20 +2720,21 @@ export default definePlugin({
     },
 
     stop() {
-        // only drop process state. IndexedDB on disk is left alone.
         if (prefetchTimer) {
             clearTimeout(prefetchTimer);
             prefetchTimer = null;
         }
-        if (uninstallFetch) {
-            uninstallFetch();
-            uninstallFetch = null;
+        if (forceUpdateTimer) {
+            clearTimeout(forceUpdateTimer);
+            forceUpdateTimer = null;
         }
         cache = null;
         setActiveCache(null);
         favoriteUrlSet = new Set();
         favoritesSeeded = false;
         lastPickerInstance = null;
+        displayViews.clear();
+        wrapAsyncGeneration += 1;
     },
 });
 
