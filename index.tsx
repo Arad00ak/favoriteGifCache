@@ -1272,6 +1272,29 @@ function getFavoriteGifRefsFromFrecency(): FavoriteGifRef[] {
     }
 }
 
+function favoriteRefsToPickerItems(refs: FavoriteGifRef[]): any[] {
+    return refs.map(ref => ({
+        url: ref.url || ref.src,
+        src: ref.src || ref.url,
+        width: ref.width,
+        height: ref.height,
+        format: ref.format,
+        order: ref.order,
+    })).filter(g => g.url || g.src);
+}
+
+async function waitForFavoriteGifRefs(
+    attempts = 12,
+    delayMs = 350,
+): Promise<FavoriteGifRef[]> {
+    for (let i = 0; i < attempts; i++) {
+        const refs = getFavoriteGifRefsFromFrecency();
+        if (refs.length) return refs;
+        await new Promise(r => setTimeout(r, delayMs));
+    }
+    return getFavoriteGifRefsFromFrecency();
+}
+
 function sortFavoritesNewestFirst(refs: FavoriteGifRef[]): FavoriteGifRef[] {
     return [...refs].sort((a, b) => {
         const ao = typeof a.order === "number" ? a.order : Number.NEGATIVE_INFINITY;
@@ -2084,6 +2107,10 @@ let wrapAsyncGeneration = 0;
 let forceUpdateTimer: ReturnType<typeof setTimeout> | null = null;
 
 const displayViews = new Map<string, any>();
+let lastGoodFavorites: any[] = [];
+let emptyRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let emptyRetryCount = 0;
+let unsubSettings: (() => void) | null = null;
 
 function maxBytesFromSettings() {
     const mb = Number(settings.store.maxMegabytes);
@@ -2218,6 +2245,16 @@ function scheduleForceUpdate(instance: any) {
         forceUpdateTimer = null;
         safeForceUpdate(instance ?? lastPickerInstance);
     }, 48);
+}
+
+function scheduleEmptyRetry(instance: any) {
+    if (emptyRetryCount >= 8) return;
+    if (emptyRetryTimer) return;
+    emptyRetryTimer = setTimeout(() => {
+        emptyRetryTimer = null;
+        emptyRetryCount += 1;
+        safeForceUpdate(instance ?? lastPickerInstance);
+    }, 250 + emptyRetryCount * 200);
 }
 
 function readRemotes(storeGif: any) {
@@ -2596,14 +2633,29 @@ export default definePlugin({
             if (!Array.isArray(favorites)) return favorites;
             if (instance && typeof instance === "object") lastPickerInstance = instance;
 
-            if (favorites.length === 0) return favorites;
+            let source = favorites;
+            if (source.length === 0) {
+                const fromStore = favoriteRefsToPickerItems(getFavoriteGifRefsFromFrecency());
+                if (fromStore.length) source = fromStore;
+                else if (lastGoodFavorites.length) source = lastGoodFavorites;
+                else {
+                    scheduleEmptyRetry(instance);
+                    return source;
+                }
+            } else {
+                emptyRetryCount = 0;
+            }
 
             const c = getCache();
 
-            for (const g of favorites) healFavoriteUrls(g);
-            const view = favorites.map(g => getStableDisplayGif(g, c.isInitialized() ? c : null));
+            for (const g of source) healFavoriteUrls(g);
+            const view = source.map(g => getStableDisplayGif(g, c.isInitialized() ? c : null));
 
-            if (view.length !== favorites.length) return favorites;
+            if (!view.length) {
+                scheduleEmptyRetry(instance);
+                return lastGoodFavorites.length ? lastGoodFavorites : source;
+            }
+            lastGoodFavorites = view;
 
             const live = new Set<string>();
             for (const v of view) {
@@ -2730,16 +2782,40 @@ export default definePlugin({
             try {
                 await getCache().init();
             } catch {
-
             }
-            refreshFavoriteSet();
+
+            const early = await waitForFavoriteGifRefs(10, 300);
+            if (early.length) {
+                lastGoodFavorites = favoriteRefsToPickerItems(early);
+                refreshFavoriteSet(early);
+            } else {
+                refreshFavoriteSet();
+            }
+
+            const onSettings = () => {
+                const refs = getFavoriteGifRefsFromFrecency();
+                if (!refs.length) return;
+                lastGoodFavorites = favoriteRefsToPickerItems(refs);
+                refreshFavoriteSet(refs);
+                safeForceUpdate(lastPickerInstance);
+            };
+            try {
+                FluxDispatcher.subscribe("USER_SETTINGS_PROTO_UPDATE", onSettings);
+                unsubSettings = () => {
+                    try {
+                        FluxDispatcher.unsubscribe("USER_SETTINGS_PROTO_UPDATE", onSettings);
+                    } catch {
+                    }
+                };
+            } catch {
+            }
 
             if (settings.store.prefetchOnStart) {
                 prefetchTimer = setTimeout(() => {
                     void prefetchFavorites().then(() => {
                         setTimeout(() => void prefetchFavorites(), 8000);
                     });
-                }, 1200);
+                }, 800);
             }
         } catch (e) {
             console.error("[FavoriteGifCache] failed to start", e);
@@ -2755,11 +2831,21 @@ export default definePlugin({
             clearTimeout(forceUpdateTimer);
             forceUpdateTimer = null;
         }
+        if (emptyRetryTimer) {
+            clearTimeout(emptyRetryTimer);
+            emptyRetryTimer = null;
+        }
+        if (unsubSettings) {
+            unsubSettings();
+            unsubSettings = null;
+        }
         cache = null;
         setActiveCache(null);
         favoriteUrlSet = new Set();
         favoritesSeeded = false;
         lastPickerInstance = null;
+        lastGoodFavorites = [];
+        emptyRetryCount = 0;
         displayViews.clear();
         wrapAsyncGeneration += 1;
     },
