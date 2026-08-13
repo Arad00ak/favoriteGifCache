@@ -2100,13 +2100,9 @@ let emptyRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let emptyRetryCount = 0;
 let unsubSettings: (() => void) | null = null;
 let mediaErrorBound = false;
-
-const displayViews = new Map<string, any>();
-let lastGoodViews: any[] = [];
+let mediaObserver: MutationObserver | null = null;
 let wrapWork: Promise<void> | null = null;
 let wrapWorkPending: {
-    instance: any;
-    view: any[];
     refs: FavoriteGifRef[];
     visibleKeys: string[];
     newlyFavorited: string[];
@@ -2259,164 +2255,34 @@ function scheduleEmptyRetry(instance: any) {
     }, 150 + emptyRetryCount * 150);
 }
 
-function readRemotes(storeGif: any) {
-    healFavoriteUrls(storeGif);
-    stashOriginalUrls(storeGif);
-    const src = remoteDisplaySrc(storeGif)
-        || (isRemoteHttpUrl(storeGif?.src) ? storeGif.src : "")
-        || (isRemoteHttpUrl(storeGif?.url) ? storeGif.url : "");
-    const url = remoteSendUrl(storeGif)
-        || (isRemoteHttpUrl(storeGif?.url) ? storeGif.url : "")
-        || src;
-    const format = typeof storeGif?.format === "number"
-        ? storeGif.format
-        : (typeof storeGif?.__fgcOriginalFormat === "number" ? storeGif.__fgcOriginalFormat : undefined);
-    return { src, url, format };
-}
-
-function gifsFromFrecency(): any[] {
-    return getFavoriteGifRefsFromFrecency().map(ref => ({
-        src: ref.src,
-        url: ref.url,
-        width: ref.width,
-        height: ref.height,
-        format: ref.format,
-        order: ref.order,
-    }));
-}
-
-function onBlobRevoking(blobUrl: string) {
-    let fallback = "";
-    for (const view of displayViews.values()) {
-        if (view.src !== blobUrl) continue;
-        const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
-        if (cdn) {
-            view.src = cdn;
-            fallback = cdn;
-        }
-    }
-    if (!fallback || typeof document === "undefined") return;
-    try {
-        for (const el of document.querySelectorAll("img,video")) {
-            const media = el as HTMLImageElement | HTMLVideoElement;
-            if (media.src === blobUrl) media.src = fallback;
-        }
-    } catch {
+function healStoreGif(gif: any) {
+    if (!gif || typeof gif !== "object") return;
+    healFavoriteUrls(gif);
+    stashOriginalUrls(gif);
+    const send = remoteSendUrl(gif);
+    if (send && isRemoteHttpUrl(send)) gif.url = send;
+    if (isBlobOrDataUrl(gif.src)) {
+        const cdn = remoteDisplaySrc(gif) || send;
+        if (cdn) gif.src = cdn;
     }
 }
 
-function onPickerMediaError(ev: Event) {
-    const el = ev.target as any;
-    if (!el || (el.tagName !== "IMG" && el.tagName !== "VIDEO")) return;
-    const src = el.currentSrc || el.src;
-    if (!src) return;
-    for (const view of displayViews.values()) {
-        if (view.src !== src && el.src !== view.src) continue;
-        const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
-        if (!cdn || cdn === src) return;
-        view.src = cdn;
-        try {
-            el.src = cdn;
-        } catch {
-        }
-        return;
+function refsFromFavorites(favorites: any[]): FavoriteGifRef[] {
+    const refs: FavoriteGifRef[] = [];
+    for (const g of favorites) {
+        const url = remoteSendUrl(g) || (isRemoteHttpUrl(g?.url) ? g.url : "") || "";
+        const src = remoteDisplaySrc(g) || (isRemoteHttpUrl(g?.src) ? g.src : "") || "";
+        if (!url && !src) continue;
+        refs.push({
+            url: url || src,
+            src: src || url,
+            width: g?.width,
+            height: g?.height,
+            format: typeof g?.format === "number" ? g.format : undefined,
+            order: g?.order,
+        });
     }
-}
-
-function bindMediaErrorHealer() {
-    if (mediaErrorBound || typeof document === "undefined") return;
-    document.addEventListener("error", onPickerMediaError, true);
-    mediaErrorBound = true;
-}
-
-function unbindMediaErrorHealer() {
-    if (!mediaErrorBound || typeof document === "undefined") return;
-    document.removeEventListener("error", onPickerMediaError, true);
-    mediaErrorBound = false;
-}
-
-function healDeadViews(c: FavoriteGifCache | null) {
-    let changed = false;
-    for (const view of displayViews.values()) {
-        const src = view.src;
-        if (isBlobOrDataUrl(src)) {
-            const live = !!(c && c.isInitialized() && c.isLiveBlobUrl(src));
-            if (!live) {
-                const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
-                if (cdn && view.src !== cdn) {
-                    view.src = cdn;
-                    changed = true;
-                }
-            }
-        } else if (src && !isRemoteHttpUrl(src)) {
-            const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
-            if (cdn) {
-                view.src = cdn;
-                changed = true;
-            }
-        }
-        if (typeof view.__fgcOriginalFormat === "number" && view.format !== view.__fgcOriginalFormat) {
-            view.format = view.__fgcOriginalFormat;
-            changed = true;
-        }
-        const send = view.__fgcOriginalUrl;
-        if (send && isRemoteHttpUrl(send) && view.url !== send) {
-            view.url = send;
-            changed = true;
-        }
-    }
-    return changed;
-}
-
-function getStableDisplayGif(storeGif: any, c: FavoriteGifCache | null): any {
-    if (!storeGif || typeof storeGif !== "object") return storeGif;
-
-    const { src: remoteSrc, url: remoteUrl, format } = readRemotes(storeGif);
-    const key = remoteUrl || remoteSrc;
-    if (!key) {
-        healFavoriteUrls(storeGif);
-        return storeGif;
-    }
-
-    const cdnSrc = remoteSrc || remoteUrl;
-    const cdnUrl = remoteUrl || remoteSrc;
-
-    let view = displayViews.get(key);
-    if (!view) {
-        view = { ...storeGif };
-        view.__fgcOriginalSrc = cdnSrc;
-        view.__fgcOriginalUrl = cdnUrl;
-        if (typeof format === "number") {
-            view.__fgcOriginalFormat = format;
-            view.format = format;
-        }
-        view.src = cdnSrc;
-        view.url = cdnUrl;
-        displayViews.set(key, view);
-    } else {
-        if (cdnSrc) view.__fgcOriginalSrc = cdnSrc;
-        if (cdnUrl) view.__fgcOriginalUrl = cdnUrl;
-        if (typeof format === "number") {
-            view.__fgcOriginalFormat = format;
-            view.format = format;
-        } else if (typeof view.__fgcOriginalFormat === "number") {
-            view.format = view.__fgcOriginalFormat;
-        }
-        if (storeGif.width != null) view.width = storeGif.width;
-        if (storeGif.height != null) view.height = storeGif.height;
-        if (storeGif.order != null) view.order = storeGif.order;
-        view.url = view.__fgcOriginalUrl || cdnUrl;
-    }
-
-    const srcNow = view.src;
-    if (!srcNow || isBlobOrDataUrl(srcNow)) {
-        const live = !!(c && isBlobOrDataUrl(srcNow) && c.isInitialized() && c.isLiveBlobUrl(srcNow));
-        if (!live) view.src = view.__fgcOriginalSrc || view.__fgcOriginalUrl || cdnSrc;
-    } else if (!isRemoteHttpUrl(srcNow)) {
-        view.src = view.__fgcOriginalSrc || view.__fgcOriginalUrl || cdnSrc;
-    }
-
-    return view;
+    return refs;
 }
 
 function pinKeysForRefs(refs: FavoriteGifRef[]): string[] {
@@ -2437,32 +2303,123 @@ function pinKeysForRefs(refs: FavoriteGifRef[]): string[] {
     return out;
 }
 
-function refsFromViews(view: any[]): FavoriteGifRef[] {
-    const refs: FavoriteGifRef[] = [];
-    for (const g of view) {
-        const url = g?.__fgcOriginalUrl || remoteSendUrl(g) || "";
-        const src = g?.__fgcOriginalSrc || remoteDisplaySrc(g) || "";
-        if (!url && !src) continue;
-        refs.push({
-            url,
-            src,
-            width: g?.width,
-            height: g?.height,
-            format: typeof g?.__fgcOriginalFormat === "number" ? g.__fgcOriginalFormat : g?.format,
-            order: g?.order,
-        });
+function restoreMediaElement(el: HTMLImageElement | HTMLVideoElement) {
+    const orig = el.dataset.fgcSrc;
+    if (!orig || orig === el.src) return;
+    try {
+        el.src = orig;
+        if (el.tagName === "VIDEO") (el as HTMLVideoElement).load();
+    } catch {
     }
-    return refs;
+}
+
+function onBlobRevoking(blobUrl: string) {
+    if (typeof document === "undefined") return;
+    try {
+        for (const node of document.querySelectorAll("img,video")) {
+            const el = node as HTMLImageElement | HTMLVideoElement;
+            if (el.src === blobUrl) restoreMediaElement(el);
+        }
+    } catch {
+    }
+}
+
+function onPickerMediaError(ev: Event) {
+    const el = ev.target as any;
+    if (!el || (el.tagName !== "IMG" && el.tagName !== "VIDEO")) return;
+    const src = el.currentSrc || el.src;
+    if (!src || !String(src).startsWith("blob:")) return;
+    restoreMediaElement(el);
+}
+
+function maybeSwapMedia(el: HTMLImageElement | HTMLVideoElement) {
+    try {
+        if (!settings.store.rewriteFavoriteSrc) return;
+        const src = el.getAttribute("src") || el.src || "";
+        if (!src || src.startsWith("blob:") || src.startsWith("data:")) return;
+        if (!isRemoteHttpUrl(src) || !isLikelyGifMediaUrl(src)) return;
+        if (favoritesSeeded && favoriteUrlSet.size > 0 && !isTrackedFavorite(src)) return;
+
+        const c = cache;
+        if (!c?.isInitialized()) return;
+        const hit = c.resolveDisplayHitSync(src, { bumpUsage: false });
+        if (!hit?.blobUrl?.startsWith("blob:") || !c.isLiveBlobUrl(hit.blobUrl)) return;
+
+        const videoEl = el.tagName === "VIDEO";
+        if (videoEl && !isVideoMime(hit.mimeType)) return;
+        if (!videoEl && isVideoMime(hit.mimeType)) return;
+
+        if (el.dataset.fgcSrc === src && el.src === hit.blobUrl) return;
+        el.dataset.fgcSrc = src;
+        el.src = hit.blobUrl;
+        if (videoEl) {
+            const v = el as HTMLVideoElement;
+            v.muted = true;
+            try { v.load(); } catch { }
+            try { void v.play(); } catch { }
+        }
+    } catch {
+    }
+}
+
+function scanPickerMedia() {
+    if (typeof document === "undefined") return;
+    try {
+        for (const node of document.querySelectorAll("img,video")) {
+            maybeSwapMedia(node as HTMLImageElement | HTMLVideoElement);
+        }
+    } catch {
+    }
+}
+
+function ensureMediaObserver() {
+    if (mediaObserver || typeof document === "undefined" || typeof MutationObserver === "undefined") return;
+    mediaObserver = new MutationObserver(muts => {
+        for (const m of muts) {
+            if (m.type === "attributes" && m.target) {
+                const t = m.target as any;
+                if (t.tagName === "IMG" || t.tagName === "VIDEO") maybeSwapMedia(t);
+            }
+            for (const n of m.addedNodes) {
+                if (n.nodeType !== 1) continue;
+                const el = n as Element;
+                if (el.tagName === "IMG" || el.tagName === "VIDEO") {
+                    maybeSwapMedia(el as any);
+                }
+                el.querySelectorAll?.("img,video").forEach(child => maybeSwapMedia(child as any));
+            }
+        }
+    });
+    mediaObserver.observe(document.body, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ["src"],
+    });
+}
+
+function bindMediaErrorHealer() {
+    if (mediaErrorBound || typeof document === "undefined") return;
+    document.addEventListener("error", onPickerMediaError, true);
+    mediaErrorBound = true;
+}
+
+function unbindMediaErrorHealer() {
+    if (!mediaErrorBound || typeof document === "undefined") return;
+    document.removeEventListener("error", onPickerMediaError, true);
+    mediaErrorBound = false;
+    if (mediaObserver) {
+        mediaObserver.disconnect();
+        mediaObserver = null;
+    }
 }
 
 function queueWrapWork(
-    instance: any,
-    view: any[],
     refs: FavoriteGifRef[],
     visibleKeys: string[],
     newlyFavorited: string[],
 ) {
-    wrapWorkPending = { instance, view, refs, visibleKeys, newlyFavorited };
+    wrapWorkPending = { refs, visibleKeys, newlyFavorited };
     if (wrapWork) return;
     wrapWork = (async () => {
         try {
@@ -2478,8 +2435,6 @@ function queueWrapWork(
 }
 
 async function runWrapWork(job: {
-    instance: any;
-    view: any[];
     refs: FavoriteGifRef[];
     visibleKeys: string[];
     newlyFavorited: string[];
@@ -2493,11 +2448,7 @@ async function runWrapWork(job: {
         if (c.has(key) && !c.hasResidentData(key)) await c.hydrate(key);
         if (c.hasResidentData(key)) c.ensureBlobUrlSync(key, { bumpUsage: false });
     }
-
-    let changed = healDeadViews(c);
-    for (const v of job.view) {
-        if (paintCachedSrc(v, c)) changed = true;
-    }
+    scanPickerMedia();
 
     for (const u of job.newlyFavorited) {
         const cacheUrl = pickCacheableUrl({ src: u, url: u });
@@ -2512,13 +2463,8 @@ async function runWrapWork(job: {
     let downloads = 0;
     for (const ref of job.refs) {
         if (downloads >= 10) break;
-        for (const u of displayCandidateUrls({
-            __fgcOriginalSrc: ref.src,
-            __fgcOriginalUrl: ref.url,
-            __fgcOriginalFormat: ref.format,
-            format: ref.format,
-        })) {
-            if (isAutoCacheDenied(u)) continue;
+        for (const u of [ref.src, ref.url]) {
+            if (!u || isAutoCacheDenied(u) || !shouldCacheFavoriteUrl(u)) continue;
             const key = cacheKeyForUrl(u);
             if (!c.has(key) && !c.has(u) && downloads < 10) {
                 await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
@@ -2529,77 +2475,7 @@ async function runWrapWork(job: {
             }
         }
     }
-
-    healDeadViews(c);
-    for (const v of job.view) {
-        if (paintCachedSrc(v, c)) changed = true;
-    }
-    if (changed) scheduleForceUpdate(job.instance);
-}
-
-function displayCandidateUrls(view: any): string[] {
-    const src = view.__fgcOriginalSrc || "";
-    const url = view.__fgcOriginalUrl || "";
-    const format = typeof view.__fgcOriginalFormat === "number" ? view.__fgcOriginalFormat : view.format;
-    const out: string[] = [];
-    const push = (u: string) => {
-        if (u && isRemoteHttpUrl(u) && !out.includes(u)) out.push(u);
-    };
-    if (format === GIF_FORMAT_VIDEO) {
-        if (isHeavyVideoUrl(src)) push(src);
-        if (isHeavyVideoUrl(url)) push(url);
-    } else {
-        if (src && !isHeavyVideoUrl(src)) push(src);
-        if (url && !isHeavyVideoUrl(url)) push(url);
-    }
-    push(src);
-    push(url);
-    return out;
-}
-
-function paintCachedSrc(view: any, c: FavoriteGifCache): boolean {
-    const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
-    const send = view.__fgcOriginalUrl || cdn;
-    let changed = false;
-
-    if (send && view.url !== send) {
-        view.url = send;
-        changed = true;
-    }
-    if (typeof view.__fgcOriginalFormat === "number" && view.format !== view.__fgcOriginalFormat) {
-        view.format = view.__fgcOriginalFormat;
-        changed = true;
-    }
-
-    if (!settings.store.rewriteFavoriteSrc) {
-        if (cdn && view.src !== cdn) {
-            view.src = cdn;
-            changed = true;
-        }
-        return changed;
-    }
-
-    const format = typeof view.__fgcOriginalFormat === "number"
-        ? view.__fgcOriginalFormat
-        : (typeof view.format === "number" ? view.format : 1);
-
-    for (const remote of displayCandidateUrls(view)) {
-        const hit = c.resolveDisplayHitSync(remote, { bumpUsage: false });
-        if (!hit?.blobUrl?.startsWith("blob:")) continue;
-        if (!mimeMatchesFormat(format, hit.mimeType)) continue;
-        if (!c.isLiveBlobUrl(hit.blobUrl)) continue;
-        if (view.src !== hit.blobUrl) {
-            view.src = hit.blobUrl;
-            changed = true;
-        }
-        return changed;
-    }
-
-    if (cdn && view.src !== cdn) {
-        view.src = cdn;
-        changed = true;
-    }
-    return changed;
+    scanPickerMedia();
 }
 
 async function applyMaxFromSettings() {
@@ -2653,7 +2529,7 @@ async function manualCacheGif(url: string) {
     if (res?.stored || c.has(cacheKeyForUrl(url))) {
         c.ensureBlobUrlSync(cacheKeyForUrl(url), { bumpUsage: true });
         toast("GIF Cached", Toasts.Type.SUCCESS);
-        safeForceUpdate(lastPickerInstance);
+        scanPickerMedia();
     } else {
         toast("Could not cache GIF", Toasts.Type.FAILURE);
     }
@@ -2846,55 +2722,27 @@ export default definePlugin({
         try {
             if (!Array.isArray(favorites)) return favorites;
             if (instance && typeof instance === "object") lastPickerInstance = instance;
+            ensureMediaObserver();
+            bindMediaErrorHealer();
 
-            let source = favorites;
-            if (source.length === 0) {
+            if (favorites.length === 0) {
                 requestFavoriteGifsLoad();
-                const seeded = gifsFromFrecency();
-                if (seeded.length) source = seeded;
-                else if (lastGoodViews.length) {
-                    scheduleEmptyRetry(instance);
-                    return lastGoodViews;
-                } else {
-                    scheduleEmptyRetry(instance);
-                    return favorites;
-                }
-            } else {
-                emptyRetryCount = 0;
+                refreshFavoriteSet();
+                scheduleEmptyRetry(instance);
+                return favorites;
             }
+            emptyRetryCount = 0;
 
-            const c = getCache();
-            if (source === favorites) {
-                for (const g of source) healFavoriteUrls(g);
-            }
+            for (const g of favorites) healStoreGif(g);
 
-            const ready = c.isInitialized() ? c : null;
-            const view = source.map(g => getStableDisplayGif(g, ready));
-            if (!view.length) return source === favorites ? favorites : view;
-
-            lastGoodViews = view;
-
-            const live = new Set<string>();
-            for (const v of view) {
-                const k = v?.__fgcOriginalUrl || v?.__fgcOriginalSrc || favoriteStableKey(v);
-                if (k) live.add(k);
-            }
-            for (const k of [...displayViews.keys()]) {
-                if (!live.has(k)) displayViews.delete(k);
-            }
-
-            const refs = refsFromViews(view);
+            const refs = refsFromFavorites(favorites);
             const newlyFavorited = refreshFavoriteSet(refs);
             const visibleKeys = pinKeysForRefs(refs);
+            const c = getCache();
             c.setDisplayPinnedKeys(visibleKeys);
-
-            if (ready) {
-                healDeadViews(ready);
-                for (const v of view) paintCachedSrc(v, ready);
-            }
-
-            queueWrapWork(instance, view, refs, visibleKeys, newlyFavorited);
-            return view;
+            queueWrapWork(refs, visibleKeys, newlyFavorited);
+            scanPickerMedia();
+            return favorites;
         } catch {
             return favorites;
         }
@@ -2922,10 +2770,12 @@ export default definePlugin({
             requestFavoriteGifsLoad();
             refreshFavoriteSet();
             bindMediaErrorHealer();
+            ensureMediaObserver();
 
             const onSettings = () => {
                 const refs = getFavoriteGifRefsFromFrecency();
                 if (refs.length) refreshFavoriteSet(refs);
+                scanPickerMedia();
                 safeForceUpdate(lastPickerInstance);
             };
             try {
@@ -2942,7 +2792,8 @@ export default definePlugin({
             if (settings.store.prefetchOnStart) {
                 prefetchTimer = setTimeout(() => {
                     void prefetchFavorites().then(() => {
-                        setTimeout(() => void prefetchFavorites(), 8000);
+                        scanPickerMedia();
+                        setTimeout(() => void prefetchFavorites().then(() => scanPickerMedia()), 8000);
                     });
                 }, 800);
             }
@@ -2976,8 +2827,6 @@ export default definePlugin({
         favoritesSeeded = false;
         lastPickerInstance = null;
         emptyRetryCount = 0;
-        displayViews.clear();
-        lastGoodViews = [];
     },
 });
 
