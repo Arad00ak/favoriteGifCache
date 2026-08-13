@@ -851,6 +851,7 @@ class FavoriteGifCache {
     private initDone = false;
     private blobUrls = new Map<string, string>();
     private metaPersistQueue = new Map<string, ReturnType<typeof setTimeout>>();
+    private revokeListener: ((blobUrl: string) => void) | null = null;
 
     constructor(options: FavoriteGifCacheOptions = {}) {
         this.core = new GifCacheCore(options);
@@ -874,6 +875,10 @@ class FavoriteGifCache {
         return this.initDone;
     }
 
+    setRevokeListener(fn: ((blobUrl: string) => void) | null) {
+        this.revokeListener = fn;
+    }
+
     async init() {
         if (!this.ready) {
             this.ready = (async () => {
@@ -882,7 +887,7 @@ class FavoriteGifCache {
 
                 for (const entry of all) {
                     this.core.loadEntry(entry);
-                    for (const key of this.core.ensureSoftMemory()) this.revokeBlob(key);
+                    this.core.ensureSoftMemory();
                 }
 
                 const before = new Set(this.core.keys());
@@ -890,9 +895,12 @@ class FavoriteGifCache {
                 const gone = removed.length
                     ? removed
                     : [...before].filter(k => !this.core.has(k));
-                if (gone.length) await this.backend.deleteMany(gone);
+                if (gone.length) {
+                    await this.backend.deleteMany(gone);
+                    for (const k of gone) this.revokeBlob(k);
+                }
 
-                for (const key of this.core.ensureSoftMemory()) this.revokeBlob(key);
+                this.core.ensureSoftMemory();
 
                 this.initDone = true;
             })();
@@ -909,9 +917,7 @@ class FavoriteGifCache {
         const fromDisk = await this.backend.get(key);
         if (!fromDisk || fromDisk.data.byteLength === 0) return false;
         this.core.loadEntry(fromDisk);
-        for (const k of this.core.ensureSoftMemory(key)) {
-            if (k !== key) this.revokeBlob(k);
-        }
+        this.core.ensureSoftMemory(key);
         return this.core.hasResidentData(key);
     }
 
@@ -1015,14 +1021,9 @@ class FavoriteGifCache {
             const stored = this.core.peek(key);
             if (stored && stored.data.byteLength > 0) {
                 await this.backend.put(stored);
-                this.revokeBlob(key);
-                this.ensureBlobUrlSync(key, { bumpUsage: false });
-            }
-
-            const pinned = new Set(this.core.getDisplayPinnedKeys());
-            for (const k of [...this.blobUrls.keys()]) {
-                if (pinned.has(k)) continue;
-                if (!this.core.hasResidentData(k)) this.revokeBlob(k);
+                if (!this.blobUrls.has(key)) {
+                    this.ensureBlobUrlSync(key, { bumpUsage: false });
+                }
             }
         }
 
@@ -1189,11 +1190,16 @@ class FavoriteGifCache {
 
     private revokeBlob(key: string) {
         const url = this.blobUrls.get(key);
-        if (url && typeof URL !== "undefined" && URL.revokeObjectURL) {
+        if (url) {
             try {
-                URL.revokeObjectURL(url);
+                this.revokeListener?.(url);
             } catch {
-
+            }
+            if (typeof URL !== "undefined" && URL.revokeObjectURL) {
+                try {
+                    URL.revokeObjectURL(url);
+                } catch {
+                }
             }
         }
         this.blobUrls.delete(key);
@@ -2088,12 +2094,23 @@ let favoriteUrlSet = new Set<string>();
 let favoritesSeeded = false;
 let prefetchTimer: ReturnType<typeof setTimeout> | null = null;
 let lastPickerInstance: { forceUpdate?: () => void; dead?: boolean } | null = null;
-let wrapAsyncGeneration = 0;
 let forceUpdateTimer: ReturnType<typeof setTimeout> | null = null;
 
 let emptyRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let emptyRetryCount = 0;
 let unsubSettings: (() => void) | null = null;
+let mediaErrorBound = false;
+
+const displayViews = new Map<string, any>();
+let lastGoodViews: any[] = [];
+let wrapWork: Promise<void> | null = null;
+let wrapWorkPending: {
+    instance: any;
+    view: any[];
+    refs: FavoriteGifRef[];
+    visibleKeys: string[];
+    newlyFavorited: string[];
+} | null = null;
 
 function maxBytesFromSettings() {
     const mb = Number(settings.store.maxMegabytes);
@@ -2118,6 +2135,7 @@ function getCache() {
             backend: createBackend(),
             smartEviction: settings.store.smartEviction !== false,
         });
+        cache.setRevokeListener(onBlobRevoking);
         setActiveCache(cache);
     }
     return cache;
@@ -2256,32 +2274,267 @@ function readRemotes(storeGif: any) {
     return { src, url, format };
 }
 
-function prepareFavoriteItem(gif: any, c: FavoriteGifCache | null) {
-    if (!gif || typeof gif !== "object") return;
-    healFavoriteUrls(gif);
-    stashOriginalUrls(gif);
+function gifsFromFrecency(): any[] {
+    return getFavoriteGifRefsFromFrecency().map(ref => ({
+        src: ref.src,
+        url: ref.url,
+        width: ref.width,
+        height: ref.height,
+        format: ref.format,
+        order: ref.order,
+    }));
+}
 
-    const { src: remoteSrc, url: remoteUrl, format } = readRemotes(gif);
-    if (remoteSrc) gif.__fgcOriginalSrc = remoteSrc;
-    if (remoteUrl) gif.__fgcOriginalUrl = remoteUrl;
-    if (typeof format === "number") {
-        gif.__fgcOriginalFormat = format;
-        gif.format = format;
-    } else if (typeof gif.__fgcOriginalFormat === "number") {
-        gif.format = gif.__fgcOriginalFormat;
+function onBlobRevoking(blobUrl: string) {
+    let fallback = "";
+    for (const view of displayViews.values()) {
+        if (view.src !== blobUrl) continue;
+        const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
+        if (cdn) {
+            view.src = cdn;
+            fallback = cdn;
+        }
+    }
+    if (!fallback || typeof document === "undefined") return;
+    try {
+        for (const el of document.querySelectorAll("img,video")) {
+            const media = el as HTMLImageElement | HTMLVideoElement;
+            if (media.src === blobUrl) media.src = fallback;
+        }
+    } catch {
+    }
+}
+
+function onPickerMediaError(ev: Event) {
+    const el = ev.target as any;
+    if (!el || (el.tagName !== "IMG" && el.tagName !== "VIDEO")) return;
+    const src = el.currentSrc || el.src;
+    if (!src) return;
+    for (const view of displayViews.values()) {
+        if (view.src !== src && el.src !== view.src) continue;
+        const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
+        if (!cdn || cdn === src) return;
+        view.src = cdn;
+        try {
+            el.src = cdn;
+        } catch {
+        }
+        return;
+    }
+}
+
+function bindMediaErrorHealer() {
+    if (mediaErrorBound || typeof document === "undefined") return;
+    document.addEventListener("error", onPickerMediaError, true);
+    mediaErrorBound = true;
+}
+
+function unbindMediaErrorHealer() {
+    if (!mediaErrorBound || typeof document === "undefined") return;
+    document.removeEventListener("error", onPickerMediaError, true);
+    mediaErrorBound = false;
+}
+
+function healDeadViews(c: FavoriteGifCache | null) {
+    let changed = false;
+    for (const view of displayViews.values()) {
+        const src = view.src;
+        if (isBlobOrDataUrl(src)) {
+            const live = !!(c && c.isInitialized() && c.isLiveBlobUrl(src));
+            if (!live) {
+                const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
+                if (cdn && view.src !== cdn) {
+                    view.src = cdn;
+                    changed = true;
+                }
+            }
+        } else if (src && !isRemoteHttpUrl(src)) {
+            const cdn = view.__fgcOriginalSrc || view.__fgcOriginalUrl;
+            if (cdn) {
+                view.src = cdn;
+                changed = true;
+            }
+        }
+        if (typeof view.__fgcOriginalFormat === "number" && view.format !== view.__fgcOriginalFormat) {
+            view.format = view.__fgcOriginalFormat;
+            changed = true;
+        }
+        const send = view.__fgcOriginalUrl;
+        if (send && isRemoteHttpUrl(send) && view.url !== send) {
+            view.url = send;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+function getStableDisplayGif(storeGif: any, c: FavoriteGifCache | null): any {
+    if (!storeGif || typeof storeGif !== "object") return storeGif;
+
+    const { src: remoteSrc, url: remoteUrl, format } = readRemotes(storeGif);
+    const key = remoteUrl || remoteSrc;
+    if (!key) {
+        healFavoriteUrls(storeGif);
+        return storeGif;
     }
 
-    const send = gif.__fgcOriginalUrl || remoteUrl;
-    if (send && isRemoteHttpUrl(send)) gif.url = send;
+    const cdnSrc = remoteSrc || remoteUrl;
+    const cdnUrl = remoteUrl || remoteSrc;
 
-    const cdn = gif.__fgcOriginalSrc || gif.__fgcOriginalUrl || remoteSrc || remoteUrl;
-    const srcNow = gif.src;
+    let view = displayViews.get(key);
+    if (!view) {
+        view = { ...storeGif };
+        view.__fgcOriginalSrc = cdnSrc;
+        view.__fgcOriginalUrl = cdnUrl;
+        if (typeof format === "number") {
+            view.__fgcOriginalFormat = format;
+            view.format = format;
+        }
+        view.src = cdnSrc;
+        view.url = cdnUrl;
+        displayViews.set(key, view);
+    } else {
+        if (cdnSrc) view.__fgcOriginalSrc = cdnSrc;
+        if (cdnUrl) view.__fgcOriginalUrl = cdnUrl;
+        if (typeof format === "number") {
+            view.__fgcOriginalFormat = format;
+            view.format = format;
+        } else if (typeof view.__fgcOriginalFormat === "number") {
+            view.format = view.__fgcOriginalFormat;
+        }
+        if (storeGif.width != null) view.width = storeGif.width;
+        if (storeGif.height != null) view.height = storeGif.height;
+        if (storeGif.order != null) view.order = storeGif.order;
+        view.url = view.__fgcOriginalUrl || cdnUrl;
+    }
+
+    const srcNow = view.src;
     if (!srcNow || isBlobOrDataUrl(srcNow)) {
         const live = !!(c && isBlobOrDataUrl(srcNow) && c.isInitialized() && c.isLiveBlobUrl(srcNow));
-        if (!live && cdn) gif.src = cdn;
-    } else if (!isRemoteHttpUrl(srcNow) && cdn) {
-        gif.src = cdn;
+        if (!live) view.src = view.__fgcOriginalSrc || view.__fgcOriginalUrl || cdnSrc;
+    } else if (!isRemoteHttpUrl(srcNow)) {
+        view.src = view.__fgcOriginalSrc || view.__fgcOriginalUrl || cdnSrc;
     }
+
+    return view;
+}
+
+function pinKeysForRefs(refs: FavoriteGifRef[]): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const add = (k: string) => {
+        if (!k || seen.has(k)) return;
+        seen.add(k);
+        out.push(k);
+    };
+    for (const ref of refs) {
+        for (const u of [ref.src, ref.url, pickCacheableUrl(ref)]) {
+            if (!u) continue;
+            add(cacheKeyForUrl(u));
+            for (const k of mediaLookupKeys(u)) add(k);
+        }
+    }
+    return out;
+}
+
+function refsFromViews(view: any[]): FavoriteGifRef[] {
+    const refs: FavoriteGifRef[] = [];
+    for (const g of view) {
+        const url = g?.__fgcOriginalUrl || remoteSendUrl(g) || "";
+        const src = g?.__fgcOriginalSrc || remoteDisplaySrc(g) || "";
+        if (!url && !src) continue;
+        refs.push({
+            url,
+            src,
+            width: g?.width,
+            height: g?.height,
+            format: typeof g?.__fgcOriginalFormat === "number" ? g.__fgcOriginalFormat : g?.format,
+            order: g?.order,
+        });
+    }
+    return refs;
+}
+
+function queueWrapWork(
+    instance: any,
+    view: any[],
+    refs: FavoriteGifRef[],
+    visibleKeys: string[],
+    newlyFavorited: string[],
+) {
+    wrapWorkPending = { instance, view, refs, visibleKeys, newlyFavorited };
+    if (wrapWork) return;
+    wrapWork = (async () => {
+        try {
+            while (wrapWorkPending) {
+                const job = wrapWorkPending;
+                wrapWorkPending = null;
+                await runWrapWork(job);
+            }
+        } finally {
+            wrapWork = null;
+        }
+    })();
+}
+
+async function runWrapWork(job: {
+    instance: any;
+    view: any[];
+    refs: FavoriteGifRef[];
+    visibleKeys: string[];
+    newlyFavorited: string[];
+}) {
+    const c = getCache();
+    await c.init();
+    c.setRevokeListener(onBlobRevoking);
+    c.setDisplayPinnedKeys(job.visibleKeys);
+
+    for (const key of job.visibleKeys) {
+        if (c.has(key) && !c.hasResidentData(key)) await c.hydrate(key);
+        if (c.hasResidentData(key)) c.ensureBlobUrlSync(key, { bumpUsage: false });
+    }
+
+    let changed = healDeadViews(c);
+    for (const v of job.view) {
+        if (paintCachedSrc(v, c)) changed = true;
+    }
+
+    for (const u of job.newlyFavorited) {
+        const cacheUrl = pickCacheableUrl({ src: u, url: u });
+        if (!cacheUrl || isAutoCacheDenied(cacheUrl)) continue;
+        try {
+            await cacheOnUserAction(c, cacheUrl, fetch, autoCacheOpts());
+            await c.ensureBlobUrl(cacheKeyForUrl(cacheUrl), { bumpUsage: false });
+        } catch {
+        }
+    }
+
+    let downloads = 0;
+    for (const ref of job.refs) {
+        if (downloads >= 10) break;
+        for (const u of displayCandidateUrls({
+            __fgcOriginalSrc: ref.src,
+            __fgcOriginalUrl: ref.url,
+            __fgcOriginalFormat: ref.format,
+            format: ref.format,
+        })) {
+            if (isAutoCacheDenied(u)) continue;
+            const key = cacheKeyForUrl(u);
+            if (!c.has(key) && !c.has(u) && downloads < 10) {
+                await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
+                downloads += 1;
+            }
+            if (c.has(key) || c.has(u)) {
+                await c.ensureBlobUrl(key, { bumpUsage: false });
+            }
+        }
+    }
+
+    healDeadViews(c);
+    for (const v of job.view) {
+        if (paintCachedSrc(v, c)) changed = true;
+    }
+    if (changed) scheduleForceUpdate(job.instance);
 }
 
 function displayCandidateUrls(view: any): string[] {
@@ -2594,110 +2847,54 @@ export default definePlugin({
             if (!Array.isArray(favorites)) return favorites;
             if (instance && typeof instance === "object") lastPickerInstance = instance;
 
-            if (favorites.length === 0) {
+            let source = favorites;
+            if (source.length === 0) {
                 requestFavoriteGifsLoad();
-                scheduleEmptyRetry(instance);
-                return favorites;
+                const seeded = gifsFromFrecency();
+                if (seeded.length) source = seeded;
+                else if (lastGoodViews.length) {
+                    scheduleEmptyRetry(instance);
+                    return lastGoodViews;
+                } else {
+                    scheduleEmptyRetry(instance);
+                    return favorites;
+                }
+            } else {
+                emptyRetryCount = 0;
             }
-            emptyRetryCount = 0;
 
             const c = getCache();
+            if (source === favorites) {
+                for (const g of source) healFavoriteUrls(g);
+            }
+
             const ready = c.isInitialized() ? c : null;
-            for (const g of favorites) prepareFavoriteItem(g, ready);
+            const view = source.map(g => getStableDisplayGif(g, ready));
+            if (!view.length) return source === favorites ? favorites : view;
 
-            const refs: FavoriteGifRef[] = [];
-            for (const g of favorites) {
-                const url = g?.__fgcOriginalUrl || remoteSendUrl(g) || "";
-                const src = g?.__fgcOriginalSrc || remoteDisplaySrc(g) || "";
-                if (!url && !src) continue;
-                refs.push({
-                    url,
-                    src,
-                    width: g?.width,
-                    height: g?.height,
-                    format: typeof g?.__fgcOriginalFormat === "number" ? g.__fgcOriginalFormat : g?.format,
-                    order: g?.order,
-                });
+            lastGoodViews = view;
+
+            const live = new Set<string>();
+            for (const v of view) {
+                const k = v?.__fgcOriginalUrl || v?.__fgcOriginalSrc || favoriteStableKey(v);
+                if (k) live.add(k);
+            }
+            for (const k of [...displayViews.keys()]) {
+                if (!live.has(k)) displayViews.delete(k);
             }
 
+            const refs = refsFromViews(view);
             const newlyFavorited = refreshFavoriteSet(refs);
-
-            const visibleKeys: string[] = [];
-            const seen = new Set<string>();
-            for (const ref of refs) {
-                for (const u of [ref.src, ref.url, pickCacheableUrl(ref)]) {
-                    if (!u) continue;
-                    const key = cacheKeyForUrl(u);
-                    if (seen.has(key)) continue;
-                    seen.add(key);
-                    visibleKeys.push(key);
-                }
-            }
+            const visibleKeys = pinKeysForRefs(refs);
             c.setDisplayPinnedKeys(visibleKeys);
 
             if (ready) {
-                for (const g of favorites) paintCachedSrc(g, ready);
+                healDeadViews(ready);
+                for (const v of view) paintCachedSrc(v, ready);
             }
 
-            const gen = ++wrapAsyncGeneration;
-            void (async () => {
-                try {
-                    await c.init();
-                    if (gen !== wrapAsyncGeneration) return;
-                    c.setDisplayPinnedKeys(visibleKeys);
-
-                    for (const key of visibleKeys) {
-                        if (c.has(key) && !c.hasResidentData(key)) await c.hydrate(key);
-                        if (c.hasResidentData(key)) c.ensureBlobUrlSync(key, { bumpUsage: false });
-                        if (gen !== wrapAsyncGeneration) return;
-                    }
-
-                    let changed = false;
-                    for (const g of favorites) {
-                        if (paintCachedSrc(g, c)) changed = true;
-                    }
-
-                    for (const u of newlyFavorited) {
-                        const cacheUrl = pickCacheableUrl({ src: u, url: u });
-                        if (!cacheUrl || isAutoCacheDenied(cacheUrl)) continue;
-                        try {
-                            await cacheOnUserAction(c, cacheUrl, fetch, autoCacheOpts());
-                            await c.ensureBlobUrl(cacheKeyForUrl(cacheUrl), { bumpUsage: false });
-                        } catch { }
-                        if (gen !== wrapAsyncGeneration) return;
-                    }
-
-                    let downloads = 0;
-                    for (const ref of refs) {
-                        if (downloads >= 10) break;
-                        for (const u of displayCandidateUrls({
-                            __fgcOriginalSrc: ref.src,
-                            __fgcOriginalUrl: ref.url,
-                            __fgcOriginalFormat: ref.format,
-                            format: ref.format,
-                        })) {
-                            if (isAutoCacheDenied(u)) continue;
-                            const key = cacheKeyForUrl(u);
-                            if (!c.has(key) && !c.has(u) && downloads < 10) {
-                                await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
-                                downloads += 1;
-                            }
-                            if (c.has(key) || c.has(u)) {
-                                await c.ensureBlobUrl(key, { bumpUsage: false });
-                            }
-                        }
-                        if (gen !== wrapAsyncGeneration) return;
-                    }
-
-                    for (const g of favorites) {
-                        if (paintCachedSrc(g, c)) changed = true;
-                    }
-                    if (changed) scheduleForceUpdate(instance);
-                } catch {
-                }
-            })();
-
-            return favorites;
+            queueWrapWork(instance, view, refs, visibleKeys, newlyFavorited);
+            return view;
         } catch {
             return favorites;
         }
@@ -2724,6 +2921,7 @@ export default definePlugin({
 
             requestFavoriteGifsLoad();
             refreshFavoriteSet();
+            bindMediaErrorHealer();
 
             const onSettings = () => {
                 const refs = getFavoriteGifRefsFromFrecency();
@@ -2770,13 +2968,16 @@ export default definePlugin({
             unsubSettings();
             unsubSettings = null;
         }
+        unbindMediaErrorHealer();
+        wrapWorkPending = null;
         cache = null;
         setActiveCache(null);
         favoriteUrlSet = new Set();
         favoritesSeeded = false;
         lastPickerInstance = null;
         emptyRetryCount = 0;
-        wrapAsyncGeneration += 1;
+        displayViews.clear();
+        lastGoodViews = [];
     },
 });
 
