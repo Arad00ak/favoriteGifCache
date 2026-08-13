@@ -4,19 +4,16 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-
-
 import { app, dialog } from "electron";
 import {
     existsSync,
     mkdirSync,
     readFileSync,
     readdirSync,
-    rmSync,
     unlinkSync,
     writeFileSync,
 } from "fs";
-import { join } from "path";
+import { join, resolve, sep } from "path";
 
 export type NativeCacheRecord = {
     key: string;
@@ -28,6 +25,39 @@ export type NativeCacheRecord = {
     size: number;
 };
 
+const ALLOWED_MEDIA_HOSTS = [
+    "media.tenor.com",
+    "tenor.com",
+    "c.tenor.com",
+    "static.klipy.com",
+    "media.klipy.com",
+    "cdn.klipy.com",
+    "gifs.klipy.com",
+    "i.klipy.com",
+    "media1.klipy.com",
+    "media2.klipy.com",
+    "c.klipy.com",
+    "klipy.com",
+    "media.giphy.com",
+    "media0.giphy.com",
+    "media1.giphy.com",
+    "media2.giphy.com",
+    "media3.giphy.com",
+    "media4.giphy.com",
+    "i.giphy.com",
+    "giphy.com",
+    "media.discordapp.net",
+    "cdn.discordapp.com",
+    "images-ext-1.discordapp.net",
+    "images-ext-2.discordapp.net",
+    "discordapp.net",
+    "discordapp.com",
+    "discord.com",
+] as const;
+
+const DEFAULT_MAX_DOWNLOAD = 12 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
+
 function blobsDir(dir: string) {
     return join(dir, "blobs");
 }
@@ -38,6 +68,39 @@ function metaPath(dir: string) {
 
 function fileNameForKey(key: string) {
     return Buffer.from(key, "utf8").toString("base64url");
+}
+
+function isSafeBlobFileName(name: string) {
+    return typeof name === "string" && /^[A-Za-z0-9_-]+$/.test(name);
+}
+
+function resolveBlobPath(dir: string, file: string): string | null {
+    if (!isSafeBlobFileName(file)) return null;
+    const root = resolve(blobsDir(dir));
+    const full = resolve(join(root, file));
+    if (full !== root && !full.startsWith(root + sep)) return null;
+    return full;
+}
+
+function hostAllowed(hostname: string) {
+    const h = hostname.toLowerCase().replace(/\.$/, "");
+    if (!h) return false;
+    for (const allowed of ALLOWED_MEDIA_HOSTS) {
+        if (h === allowed || h.endsWith("." + allowed)) return true;
+    }
+    return false;
+}
+
+function isAllowedMediaUrl(url: string): URL | null {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return null;
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    if (!hostAllowed(parsed.hostname)) return null;
+    return parsed;
 }
 
 function readMeta(dir: string): Record<string, Omit<NativeCacheRecord, "data" | "key"> & { file: string; }> {
@@ -58,83 +121,54 @@ export function getDefaultCacheDir() {
     return join(app.getPath("userData"), "FavoriteGifCache");
 }
 
-
-const ALLOWED_MEDIA_HOSTS = [
-
-    "media.tenor.com",
-    "tenor.com",
-    "c.tenor.com",
-
-    "static.klipy.com",
-    "api.klipy.com",
-    "media.klipy.com",
-    "cdn.klipy.com",
-    "gifs.klipy.com",
-    "i.klipy.com",
-    "media1.klipy.com",
-    "media2.klipy.com",
-    "c.klipy.com",
-    "klipy.com",
-
-    "media.giphy.com",
-    "media0.giphy.com",
-    "media1.giphy.com",
-    "media2.giphy.com",
-    "media3.giphy.com",
-    "media4.giphy.com",
-    "i.giphy.com",
-
-    "media.discordapp.net",
-    "cdn.discordapp.com",
-    "images-ext-1.discordapp.net",
-    "images-ext-2.discordapp.net",
-    "discordapp.net",
-    "discord.com",
-];
-
-const DEFAULT_MAX_DOWNLOAD = 12 * 1024 * 1024;
-
-function hostAllowed(hostname: string) {
-    const h = hostname.toLowerCase();
-    if (h.includes("klipy.com") || h.includes("tenor.com") || h.includes("giphy.com")) {
-        return true;
-    }
-    return ALLOWED_MEDIA_HOSTS.some(a => h === a || h.endsWith("." + a));
-}
-
-
 export async function fetchMedia(
     _e: unknown,
     url: string,
     maxBytes: number = DEFAULT_MAX_DOWNLOAD,
 ): Promise<{ data: ArrayBuffer; type: string; } | null> {
     if (!url || typeof url !== "string") return null;
-    let parsed: URL;
-    try {
-        parsed = new URL(url);
-    } catch {
-        return null;
+
+    let current = url;
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+        const parsed = isAllowedMediaUrl(current);
+        if (!parsed) return null;
+
+        const res = await fetch(parsed.href, {
+            headers: { Accept: "image/*,video/*,*/*;q=0.8" },
+            redirect: "manual",
+            credentials: "omit",
+        });
+
+        if (res.status >= 300 && res.status < 400) {
+            const loc = res.headers.get("location");
+            if (!loc) return null;
+            let next: URL;
+            try {
+                next = new URL(loc, parsed.href);
+            } catch {
+                return null;
+            }
+            if (!isAllowedMediaUrl(next.href)) return null;
+            current = next.href;
+            continue;
+        }
+
+        if (!res.ok) return null;
+
+        const lenHeader = res.headers.get("content-length");
+        if (lenHeader) {
+            const len = Number(lenHeader);
+            if (Number.isFinite(len) && len > maxBytes) return null;
+        }
+
+        const buf = await res.arrayBuffer();
+        if (!buf.byteLength || buf.byteLength > maxBytes) return null;
+
+        const type = (res.headers.get("content-type") || "application/octet-stream").split(";")[0]!.trim();
+        return { data: buf, type };
     }
-    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
-    if (!hostAllowed(parsed.hostname)) return null;
 
-    const res = await fetch(parsed.href, {
-        headers: { Accept: "image/*,video/*,*/*;q=0.8" },
-        redirect: "follow",
-    });
-    if (!res.ok) return null;
-
-    const lenHeader = res.headers.get("content-length");
-    if (lenHeader) {
-        const len = Number(lenHeader);
-        if (Number.isFinite(len) && len > maxBytes) return null;
-    }
-
-    const buf = await res.arrayBuffer();
-    if (!buf.byteLength || buf.byteLength > maxBytes) return null;
-
-    const type = (res.headers.get("content-type") || "application/octet-stream").split(";")[0]!.trim();
-    return { data: buf, type };
+    return null;
 }
 
 export async function pickCacheDirectory(_e: unknown, defaultPath?: string) {
@@ -162,8 +196,9 @@ export async function loadAllEntries(_e: unknown, dir: string): Promise<NativeCa
 
     for (const [key, info] of Object.entries(meta)) {
         try {
-            const file = join(blobsDir(dir), info.file || fileNameForKey(key));
-            if (!existsSync(file)) continue;
+            const name = isSafeBlobFileName(info.file) ? info.file : fileNameForKey(key);
+            const file = resolveBlobPath(dir, name);
+            if (!file || !existsSync(file)) continue;
             const buf = readFileSync(file);
             const data = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
             out.push({
@@ -176,7 +211,6 @@ export async function loadAllEntries(_e: unknown, dir: string): Promise<NativeCa
                 size: typeof info.size === "number" ? info.size : buf.byteLength,
             });
         } catch {
-
         }
     }
     return out;
@@ -185,7 +219,8 @@ export async function loadAllEntries(_e: unknown, dir: string): Promise<NativeCa
 export async function putEntry(_e: unknown, dir: string, entry: NativeCacheRecord) {
     await ensureCacheDir(_e, dir);
     const file = fileNameForKey(entry.key);
-    const full = join(blobsDir(dir), file);
+    const full = resolveBlobPath(dir, file);
+    if (!full) throw new Error("Invalid cache key");
     const bytes = Buffer.from(entry.data);
     writeFileSync(full, bytes);
 
@@ -205,14 +240,12 @@ export async function deleteEntry(_e: unknown, dir: string, key: string) {
     await ensureCacheDir(_e, dir);
     const meta = readMeta(dir);
     const info = meta[key];
-    if (info?.file) {
-        const full = join(blobsDir(dir), info.file);
-        if (existsSync(full)) {
-            try {
-                unlinkSync(full);
-            } catch {
-
-            }
+    const name = info?.file && isSafeBlobFileName(info.file) ? info.file : fileNameForKey(key);
+    const full = resolveBlobPath(dir, name);
+    if (full && existsSync(full)) {
+        try {
+            unlinkSync(full);
+        } catch {
         }
     }
     delete meta[key];
@@ -230,19 +263,14 @@ export async function clearCacheDir(_e: unknown, dir: string) {
     const bdir = blobsDir(dir);
     if (existsSync(bdir)) {
         for (const name of readdirSync(bdir)) {
+            if (!isSafeBlobFileName(name)) continue;
+            const full = resolveBlobPath(dir, name);
+            if (!full) continue;
             try {
-                unlinkSync(join(bdir, name));
+                unlinkSync(full);
             } catch {
-
             }
         }
     }
     writeMeta(dir, {});
-}
-
-
-export async function wipeCacheDir(_e: unknown, dir: string) {
-    if (!dir || !existsSync(dir)) return;
-    rmSync(dir, { recursive: true, force: true });
-    await ensureCacheDir(_e, dir);
 }

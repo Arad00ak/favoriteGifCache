@@ -619,7 +619,7 @@ function createBackendForPath(
     return createDefaultBackend();
 }
 
-const TENOR_HOST_MARKERS = [
+const TENOR_HOSTS = [
     "media.tenor.com",
     "c.tenor.com",
     "tenor.com",
@@ -627,7 +627,6 @@ const TENOR_HOST_MARKERS = [
 
 const KLIPY_MEDIA_HOSTS = [
     "static.klipy.com",
-    "api.klipy.com",
     "media.klipy.com",
     "cdn.klipy.com",
     "gifs.klipy.com",
@@ -638,6 +637,34 @@ const KLIPY_MEDIA_HOSTS = [
     "klipy.com",
 ] as const;
 
+const GIPHY_HOSTS = [
+    "media.giphy.com",
+    "media0.giphy.com",
+    "media1.giphy.com",
+    "media2.giphy.com",
+    "media3.giphy.com",
+    "media4.giphy.com",
+    "i.giphy.com",
+    "giphy.com",
+] as const;
+
+const DISCORD_MEDIA_HOSTS = [
+    "media.discordapp.net",
+    "cdn.discordapp.com",
+    "images-ext-1.discordapp.net",
+    "images-ext-2.discordapp.net",
+] as const;
+
+const ALL_ALLOWED_HOSTS: readonly string[] = [
+    ...TENOR_HOSTS,
+    ...KLIPY_MEDIA_HOSTS,
+    ...GIPHY_HOSTS,
+    ...DISCORD_MEDIA_HOSTS,
+    "discord.com",
+    "discordapp.com",
+    "discordapp.net",
+];
+
 function hostnameOf(url: string): string | null {
     try {
         return new URL(url).hostname.toLowerCase();
@@ -646,18 +673,23 @@ function hostnameOf(url: string): string | null {
     }
 }
 
+function hostAllowed(hostname: string): boolean {
+    const h = hostname.toLowerCase().replace(/\.$/, "");
+    if (!h) return false;
+    for (const allowed of ALL_ALLOWED_HOSTS) {
+        if (h === allowed || h.endsWith("." + allowed)) return true;
+    }
+    return false;
+}
+
 function isTenorHost(hostname: string): boolean {
-    const h = hostname.toLowerCase();
-    return h === "tenor.com"
-        || h.endsWith(".tenor.com")
-        || h.includes("tenor.com");
+    const h = hostname.toLowerCase().replace(/\.$/, "");
+    return h === "tenor.com" || h.endsWith(".tenor.com");
 }
 
 function isKlipyHost(hostname: string): boolean {
-    const h = hostname.toLowerCase();
-    return h === "klipy.com"
-        || h.endsWith(".klipy.com")
-        || h.includes("klipy.com");
+    const h = hostname.toLowerCase().replace(/\.$/, "");
+    return h === "klipy.com" || h.endsWith(".klipy.com");
 }
 
 function isTenorUrl(url: string): boolean {
@@ -671,19 +703,7 @@ function isKlipyUrl(url: string): boolean {
 }
 
 function isGifProviderHost(hostname: string): boolean {
-    const h = hostname.toLowerCase();
-    if (isTenorHost(h) || isKlipyHost(h)) return true;
-    if (h.includes("giphy.com")) return true;
-    if (
-        h.includes("media.discordapp")
-        || h.includes("cdn.discordapp")
-        || h.includes("discordapp.net")
-        || h.includes("images-ext-1.discordapp.net")
-        || h.includes("images-ext-2.discordapp.net")
-    ) {
-        return true;
-    }
-    return false;
+    return hostAllowed(hostname);
 }
 
 function tenorToKlipyFallbackUrls(url: string): string[] {
@@ -701,14 +721,12 @@ function tenorToKlipyFallbackUrls(url: string): string[] {
         try {
             const u = new URL(parsed.href);
             u.hostname = host;
-
             u.protocol = "https:";
             const href = u.href;
             if (seen.has(href)) continue;
             seen.add(href);
             out.push(href);
         } catch {
-
         }
     }
     return out;
@@ -744,7 +762,6 @@ function mediaLookupKeys(url: string): string[] {
         }
         add(u.href);
     } catch {
-
     }
 
     for (const alt of tenorToKlipyFallbackUrls(url)) {
@@ -753,7 +770,6 @@ function mediaLookupKeys(url: string): string[] {
             const u = new URL(alt);
             add(`${u.origin}${u.pathname}`);
         } catch {
-
         }
     }
 
@@ -1279,7 +1295,7 @@ function cacheKeyForUrl(url: string) {
     if (!url) return url;
     try {
         const u = new URL(url);
-        if (isGifProviderHost(u.hostname) || u.hostname.includes("discord.com")) {
+        if (isGifProviderHost(u.hostname)) {
             return `${u.origin}${u.pathname}`;
         }
         return u.href;
@@ -1304,8 +1320,8 @@ function isLikelyGifMediaUrl(url: string) {
     if (url.startsWith("blob:") || url.startsWith("data:")) return false;
     try {
         const u = new URL(url);
-        if (isGifProviderHost(u.hostname)) return true;
-        return /\.(gif|mp4|webm|webp|png|jpe?g)(\?|$)/i.test(u.pathname);
+        if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+        return isGifProviderHost(u.hostname);
     } catch {
         return false;
     }
@@ -1528,11 +1544,23 @@ function guessMime(url: string, contentType: string | null, data?: Uint8Array) {
     return "image/gif";
 }
 
+function isDownloadableUrl(url: string) {
+    try {
+        const u = new URL(url);
+        if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+        return hostAllowed(u.hostname);
+    } catch {
+        return false;
+    }
+}
+
 async function downloadOneUrl(
     url: string,
     fetchImpl: typeof fetch,
     maxBytes: number,
 ): Promise<{ data: Uint8Array; mime: string; } | null> {
+    if (!isDownloadableUrl(url)) return null;
+
     const native = getPluginNative();
     if (native && typeof (native as any).fetchMedia === "function") {
         try {
@@ -1549,9 +1577,7 @@ async function downloadOneUrl(
                 }
             }
         } catch {
-
         }
-
         return null;
     }
 
@@ -1560,6 +1586,7 @@ async function downloadOneUrl(
             credentials: "omit",
             cache: "force-cache",
             mode: "cors",
+            redirect: "error",
         } as RequestInit);
         if (!res.ok) return null;
         const buf = new Uint8Array(await res.arrayBuffer());
