@@ -75,25 +75,12 @@ class GifCacheCore {
         return this.enforceCap();
     }
 
-    getSoftMemoryBytes() {
-        return this.softMemoryBytes;
-    }
-
     setProtectedKeys(keys: Iterable<string>) {
         this.protectedKeys = new Set(keys);
     }
 
-    getProtectedKeys(): string[] {
-        return [...this.protectedKeys];
-    }
-
-    
     setDisplayPinnedKeys(keys: Iterable<string>) {
         this.displayPinnedKeys = new Set(keys);
-    }
-
-    getDisplayPinnedKeys(): string[] {
-        return [...this.displayPinnedKeys];
     }
 
     size() {
@@ -133,10 +120,7 @@ class GifCacheCore {
     get(key: string): CacheEntry | null {
         const entry = this.entries.get(key);
         if (!entry) return null;
-
-        entry.useCount += 1;
-        entry.lastUsed = this.now();
-
+        this.touch(key);
         return { ...entry, data: entry.data.slice() };
     }
 
@@ -146,15 +130,23 @@ class GifCacheCore {
         return { ...entry, data: entry.data.slice() };
     }
 
+    peekRef(key: string): CacheEntry | null {
+        return this.entries.get(key) ?? null;
+    }
+
+    touch(key: string) {
+        const entry = this.entries.get(key);
+        if (!entry) return false;
+        entry.useCount += 1;
+        entry.lastUsed = this.now();
+        return true;
+    }
+
     getMeta(key: string): CacheMeta | null {
         const entry = this.entries.get(key);
         if (!entry) return null;
         const { data: _d, ...meta } = entry;
         return { ...meta };
-    }
-
-    listMeta(): CacheMeta[] {
-        return [...this.entries.values()].map(({ data: _d, ...meta }) => ({ ...meta }));
     }
 
     
@@ -619,12 +611,6 @@ function createBackendForPath(
     return createDefaultBackend();
 }
 
-const TENOR_HOSTS = [
-    "media.tenor.com",
-    "c.tenor.com",
-    "tenor.com",
-] as const;
-
 const KLIPY_MEDIA_HOSTS = [
     "static.klipy.com",
     "media.klipy.com",
@@ -637,7 +623,11 @@ const KLIPY_MEDIA_HOSTS = [
     "klipy.com",
 ] as const;
 
-const GIPHY_HOSTS = [
+const ALL_ALLOWED_HOSTS = [
+    "media.tenor.com",
+    "c.tenor.com",
+    "tenor.com",
+    ...KLIPY_MEDIA_HOSTS,
     "media.giphy.com",
     "media0.giphy.com",
     "media1.giphy.com",
@@ -646,32 +636,14 @@ const GIPHY_HOSTS = [
     "media4.giphy.com",
     "i.giphy.com",
     "giphy.com",
-] as const;
-
-const DISCORD_MEDIA_HOSTS = [
     "media.discordapp.net",
     "cdn.discordapp.com",
     "images-ext-1.discordapp.net",
     "images-ext-2.discordapp.net",
-] as const;
-
-const ALL_ALLOWED_HOSTS: readonly string[] = [
-    ...TENOR_HOSTS,
-    ...KLIPY_MEDIA_HOSTS,
-    ...GIPHY_HOSTS,
-    ...DISCORD_MEDIA_HOSTS,
     "discord.com",
     "discordapp.com",
     "discordapp.net",
-];
-
-function hostnameOf(url: string): string | null {
-    try {
-        return new URL(url).hostname.toLowerCase();
-    } catch {
-        return null;
-    }
-}
+] as const;
 
 function hostAllowed(hostname: string): boolean {
     const h = hostname.toLowerCase().replace(/\.$/, "");
@@ -682,28 +654,13 @@ function hostAllowed(hostname: string): boolean {
     return false;
 }
 
-function isTenorHost(hostname: string): boolean {
-    const h = hostname.toLowerCase().replace(/\.$/, "");
-    return h === "tenor.com" || h.endsWith(".tenor.com");
-}
-
-function isKlipyHost(hostname: string): boolean {
-    const h = hostname.toLowerCase().replace(/\.$/, "");
-    return h === "klipy.com" || h.endsWith(".klipy.com");
-}
-
 function isTenorUrl(url: string): boolean {
-    const h = hostnameOf(url);
-    return !!h && isTenorHost(h);
-}
-
-function isKlipyUrl(url: string): boolean {
-    const h = hostnameOf(url);
-    return !!h && isKlipyHost(h);
-}
-
-function isGifProviderHost(hostname: string): boolean {
-    return hostAllowed(hostname);
+    try {
+        const h = new URL(url).hostname.toLowerCase().replace(/\.$/, "");
+        return h === "tenor.com" || h.endsWith(".tenor.com");
+    } catch {
+        return false;
+    }
 }
 
 function tenorToKlipyFallbackUrls(url: string): string[] {
@@ -757,7 +714,7 @@ function mediaLookupKeys(url: string): string[] {
     add(url);
     try {
         const u = new URL(url);
-        if (isGifProviderHost(u.hostname)) {
+        if (hostAllowed(u.hostname)) {
             add(`${u.origin}${u.pathname}`);
         }
         add(u.href);
@@ -820,18 +777,6 @@ function sniffMime(data: Uint8Array, fallback = "application/octet-stream"): str
     return fallback;
 }
 
-function isSniffedVideoMime(mime: string | null | undefined) {
-    if (!mime) return false;
-    const m = mime.toLowerCase().split(";")[0]!.trim();
-    return m.startsWith("video/") || m === "application/mp4";
-}
-
-function isSniffedImageMime(mime: string | null | undefined) {
-    if (!mime) return false;
-    const m = mime.toLowerCase().split(";")[0]!.trim();
-    return m.startsWith("image/");
-}
-
 interface FavoriteGifCacheOptions extends CacheCoreOptions {
     backend?: StorageBackend;
     
@@ -857,14 +802,6 @@ class FavoriteGifCache {
         this.core = new GifCacheCore(options);
         this.backend = options.backend ?? createDefaultBackend();
         this.smartEviction = options.smartEviction !== false;
-    }
-
-    get backendName() {
-        return this.backend.name;
-    }
-
-    getSmartEviction() {
-        return this.smartEviction;
     }
 
     setSmartEviction(enabled: boolean) {
@@ -966,18 +903,8 @@ class FavoriteGifCache {
         return this.core.keys();
     }
 
-    listMeta() {
-        return this.core.listMeta();
-    }
-
-    async get(key: string): Promise<CacheEntry | null> {
-        await this.init();
-        if (this.core.needsHydrate(key)) await this.hydrate(key);
-        const entry = this.core.get(key);
-        if (!entry || entry.data.byteLength === 0) return null;
-
-        await this.backend.put(entry);
-        return entry;
+    peekSync(key: string) {
+        return this.core.peek(key);
     }
 
     async peek(key: string) {
@@ -986,18 +913,17 @@ class FavoriteGifCache {
         return this.core.peek(key);
     }
 
-    peekSync(key: string) {
-        return this.core.peek(key);
-    }
-
-    getMetaSync(key: string) {
-        return this.core.getMeta(key);
+    async get(key: string) {
+        await this.init();
+        if (this.core.needsHydrate(key)) await this.hydrate(key);
+        const entry = this.core.get(key);
+        return entry && entry.data.byteLength > 0 ? entry : null;
     }
 
     touchSync(key: string) {
-        const entry = this.core.get(key);
-        if (!entry) return false;
-        this.scheduleMetaPersist(entry);
+        if (!this.core.touch(key)) return false;
+        const entry = this.core.peekRef(key);
+        if (entry) this.scheduleMetaPersist(entry);
         return true;
     }
 
@@ -1040,22 +966,6 @@ class FavoriteGifCache {
         return ok;
     }
 
-    
-    async pruneNotIn(keepKeys: Iterable<string>) {
-        await this.init();
-        const keep = new Set(keepKeys);
-        const drop: string[] = [];
-        for (const key of this.core.keys()) {
-            if (!keep.has(key)) drop.push(key);
-        }
-        for (const key of drop) {
-            this.core.delete(key);
-            this.revokeBlob(key);
-        }
-        if (drop.length) await this.backend.deleteMany(drop);
-        return drop;
-    }
-
     async clear() {
         await this.init();
         for (const k of [...this.blobUrls.keys()]) this.revokeBlob(k);
@@ -1078,23 +988,18 @@ class FavoriteGifCache {
 
         if (this.core.needsHydrate(key)) return null;
 
-        const entry = bump ? this.core.get(key) : this.core.peek(key);
+        const entry = this.core.peekRef(key);
         if (!entry || entry.data.byteLength === 0) return null;
-        if (bump) this.scheduleMetaPersist(entry);
+        if (bump) this.touchSync(key);
 
         try {
-
             const copy = entry.data.slice();
-            const ab = copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength);
             const mime = sniffMime(copy, entry.mimeType || "application/octet-stream");
-            const blob = new Blob([ab], { type: mime || "application/octet-stream" });
+            const blob = new Blob([copy], { type: mime || "application/octet-stream" });
             if (blob.size <= 0) return null;
             const url = URL.createObjectURL(blob);
             this.blobUrls.set(key, url);
-
-            if (mime && mime !== entry.mimeType) {
-                entry.mimeType = mime;
-            }
+            if (mime && mime !== entry.mimeType) entry.mimeType = mime;
             return url;
         } catch {
             return null;
@@ -1110,12 +1015,6 @@ class FavoriteGifCache {
         return this.ensureBlobUrlSync(key, opts);
     }
 
-    resolveDisplayUrlSync(remoteUrl: string): string | null {
-        const hit = this.resolveDisplayHitSync(remoteUrl);
-        return hit?.blobUrl ?? null;
-    }
-
-    
     resolveDisplayHitSync(remoteUrl: string, opts: BlobUrlOptions = {}): { blobUrl: string; mimeType?: string; key: string; } | null {
         if (!remoteUrl || remoteUrl.startsWith("blob:") || remoteUrl.startsWith("data:")) {
             return null;
@@ -1144,26 +1043,6 @@ class FavoriteGifCache {
         return null;
     }
 
-    
-    warmAllBlobUrls(keys?: string[]) {
-        const list = keys ?? this.core.keys();
-        let n = 0;
-        for (const key of list) {
-            if (!this.core.hasResidentData(key)) continue;
-            if (this.ensureBlobUrlSync(key, { bumpUsage: false })) n += 1;
-        }
-        return n;
-    }
-
-    async getBlobUrl(key: string) {
-        return this.ensureBlobUrl(key, { bumpUsage: true });
-    }
-
-    getCachedBlobUrl(key: string) {
-        return this.blobUrls.get(key);
-    }
-
-    
     isLiveBlobUrl(blobUrl: string) {
         if (!blobUrl || !blobUrl.startsWith("blob:")) return false;
         for (const u of this.blobUrls.values()) {
@@ -1203,10 +1082,6 @@ class FavoriteGifCache {
             }
         }
         this.blobUrls.delete(key);
-    }
-
-    getCoreForTests() {
-        return this.core;
     }
 }
 
@@ -1298,8 +1173,6 @@ function sortFavoritesNewestFirst(refs: FavoriteGifRef[]): FavoriteGifRef[] {
     });
 }
 
-const PREFETCH_WARM_NEWEST = 16;
-
 function prefetchTargetBytes(maxBytes: number): number {
     if (!Number.isFinite(maxBytes) || maxBytes <= 0) return 0;
     return Math.max(1, Math.floor(maxBytes / 3));
@@ -1309,7 +1182,7 @@ function cacheKeyForUrl(url: string) {
     if (!url) return url;
     try {
         const u = new URL(url);
-        if (isGifProviderHost(u.hostname)) {
+        if (hostAllowed(u.hostname)) {
             return `${u.origin}${u.pathname}`;
         }
         return u.href;
@@ -1335,7 +1208,7 @@ function isLikelyGifMediaUrl(url: string) {
     try {
         const u = new URL(url);
         if (u.protocol !== "https:" && u.protocol !== "http:") return false;
-        return isGifProviderHost(u.hostname);
+        return hostAllowed(u.hostname);
     } catch {
         return false;
     }
@@ -1350,16 +1223,6 @@ function isHeavyVideoUrl(url: string) {
     } catch {
         return /\.(mp4|webm|mov|m4v)(\?|$)/i.test(url);
     }
-}
-
-function isHeavyVideoMime(mime: string | null | undefined) {
-    if (!mime) return false;
-    const m = mime.toLowerCase().split(";")[0]!.trim();
-    return m.startsWith("video/") || m === "application/mp4";
-}
-
-function isCacheableFavoriteUrl(url: string) {
-    return isLikelyGifMediaUrl(url);
 }
 
 const GIF_FORMAT_IMAGE = 1;
@@ -1437,11 +1300,6 @@ function remoteDisplaySrc(gif: any): string {
     return "";
 }
 
-function favoriteStableKey(gif: any): string {
-    if (!gif || typeof gif !== "object") return "";
-    return remoteSendUrl(gif) || remoteDisplaySrc(gif) || "";
-}
-
 function restoreUrlsForSend(gif: any): void {
     if (!gif || typeof gif !== "object") return;
     stashOriginalUrls(gif);
@@ -1460,7 +1318,6 @@ function healFavoriteUrls(gif: any): void {
 const STORE_KEY = "FavoriteGifCache.autoCacheDenylist";
 
 let denied = new Set<string>();
-let loaded = false;
 
 function keysFor(url: string) {
     const k = cacheKeyForUrl(url);
@@ -1474,7 +1331,6 @@ async function loadDenylist() {
     } catch {
         denied = new Set();
     }
-    loaded = true;
 }
 
 async function persist() {
@@ -1499,14 +1355,6 @@ async function allowAutoCache(url: string) {
     await persist();
 }
 
-function denylistSize() {
-    return denied.size;
-}
-
-function isDenylistLoaded() {
-    return loaded;
-}
-
 type Native = PluginNative<typeof import("./native")>;
 
 function getPluginNative(): Native | null {
@@ -1529,10 +1377,6 @@ function getPluginNative(): Native | null {
     } catch {
         return null;
     }
-}
-
-function hasFileNative() {
-    return getPluginNative() != null;
 }
 
 const inflight = new Map<string, Promise<{ data: Uint8Array; mime: string; } | null>>();
@@ -2098,9 +1942,8 @@ let favoriteUrlSet = new Set<string>();
 let favoritesSeeded = false;
 let prefetchTimer: ReturnType<typeof setTimeout> | null = null;
 let lastPickerInstance: { forceUpdate?: () => void; dead?: boolean } | null = null;
-let forceUpdateTimer: ReturnType<typeof setTimeout> | null = null;
-
 let emptyRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let scanTimer: ReturnType<typeof setTimeout> | null = null;
 let emptyRetryCount = 0;
 let unsubSettings: (() => void) | null = null;
 let mediaErrorBound = false;
@@ -2115,7 +1958,6 @@ let wrapWorkPending: {
     favorites: any[];
     refs: FavoriteGifRef[];
     visibleKeys: string[];
-    newlyFavorited: string[];
 } | null = null;
 
 function maxBytesFromSettings() {
@@ -2310,10 +2152,8 @@ function isTrackedFavorite(url: string) {
     return favoriteUrlSet.has(url) || favoriteUrlSet.has(cacheKeyForUrl(url));
 }
 
-function shouldCacheFavoriteUrl(url: string, _format?: number) {
-    if (!url || url.startsWith("blob:") || url.startsWith("data:")) return false;
-
-    return isCacheableFavoriteUrl(url) || isLikelyGifMediaUrl(url);
+function shouldCacheFavoriteUrl(url: string) {
+    return !!url && isLikelyGifMediaUrl(url);
 }
 
 function newRefsForUrls(urls: string[], refs: FavoriteGifRef[]): FavoriteGifRef[] {
@@ -2385,14 +2225,6 @@ function safeForceUpdate(instance: any) {
     } catch {
 
     }
-}
-
-function scheduleForceUpdate(instance: any) {
-    if (forceUpdateTimer) clearTimeout(forceUpdateTimer);
-    forceUpdateTimer = setTimeout(() => {
-        forceUpdateTimer = null;
-        safeForceUpdate(instance ?? lastPickerInstance);
-    }, 48);
 }
 
 function scheduleEmptyRetry(instance: any) {
@@ -2560,12 +2392,16 @@ function maybeSwapMedia(el: HTMLImageElement | HTMLVideoElement) {
 
 function scanPickerMedia() {
     if (typeof document === "undefined") return;
-    try {
-        for (const node of document.querySelectorAll("img,video")) {
-            maybeSwapMedia(node as HTMLImageElement | HTMLVideoElement);
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => {
+        scanTimer = null;
+        try {
+            for (const node of document.querySelectorAll("img,video")) {
+                maybeSwapMedia(node as HTMLImageElement | HTMLVideoElement);
+            }
+        } catch {
         }
-    } catch {
-    }
+    }, 32);
 }
 
 function ensureMediaObserver() {
@@ -2614,9 +2450,8 @@ function queueWrapWork(
     favorites: any[],
     refs: FavoriteGifRef[],
     visibleKeys: string[],
-    newlyFavorited: string[],
 ) {
-    wrapWorkPending = { favorites, refs, visibleKeys, newlyFavorited };
+    wrapWorkPending = { favorites, refs, visibleKeys };
     if (wrapWork) return;
     wrapWork = (async () => {
         try {
@@ -2635,11 +2470,9 @@ async function runWrapWork(job: {
     favorites: any[];
     refs: FavoriteGifRef[];
     visibleKeys: string[];
-    newlyFavorited: string[];
 }) {
     const c = getCache();
     await c.init();
-    c.setRevokeListener(onBlobRevoking);
     c.setDisplayPinnedKeys(job.visibleKeys);
 
     for (const key of job.visibleKeys) {
@@ -2648,8 +2481,6 @@ async function runWrapWork(job: {
     }
     for (const g of job.favorites) applyCacheSrc(g, c);
     scanPickerMedia();
-
-    await cacheNewFavoriteRefs(newRefsForUrls(job.newlyFavorited, job.refs));
 
     let downloads = 0;
     for (const ref of job.refs) {
@@ -2668,10 +2499,6 @@ async function runWrapWork(job: {
     }
     for (const g of job.favorites) applyCacheSrc(g, c);
     scanPickerMedia();
-}
-
-async function applyMaxFromSettings() {
-    await applyLimitsFromSettings();
 }
 
 function toast(message: string, type: any) {
@@ -2977,7 +2804,7 @@ export default definePlugin({
             enqueueFavoriteDiff(added, [], refs);
             const visibleKeys = pinKeysForRefs(refs);
             c.setDisplayPinnedKeys(visibleKeys);
-            queueWrapWork(favorites, refs, visibleKeys, added);
+            queueWrapWork(favorites, refs, visibleKeys);
             scanPickerMedia();
             return favorites;
         } catch {
@@ -2997,7 +2824,7 @@ export default definePlugin({
 
             }
             await loadDenylist();
-            await applyMaxFromSettings();
+            await applyLimitsFromSettings();
 
             try {
                 await getCache().init();
@@ -3017,7 +2844,6 @@ export default definePlugin({
 
             const onSettings = () => {
                 syncFromFrecency();
-                void warmCachedFavoriteBlobs();
             };
             try {
                 FluxDispatcher.subscribe("USER_SETTINGS_PROTO_UPDATE", onSettings);
@@ -3048,9 +2874,9 @@ export default definePlugin({
             clearTimeout(prefetchTimer);
             prefetchTimer = null;
         }
-        if (forceUpdateTimer) {
-            clearTimeout(forceUpdateTimer);
-            forceUpdateTimer = null;
+        if (scanTimer) {
+            clearTimeout(scanTimer);
+            scanTimer = null;
         }
         if (emptyRetryTimer) {
             clearTimeout(emptyRetryTimer);
