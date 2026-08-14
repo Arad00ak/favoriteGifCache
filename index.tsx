@@ -1160,11 +1160,6 @@ function sortFavoritesNewestFirst(refs: FavoriteGifRef[]): FavoriteGifRef[] {
     });
 }
 
-function prefetchTargetBytes(maxBytes: number): number {
-    if (!Number.isFinite(maxBytes) || maxBytes <= 0) return 0;
-    return Math.max(1, Math.floor(maxBytes / 3));
-}
-
 function cacheKeyForUrl(url: string) {
     if (!url) return url;
     try {
@@ -1654,7 +1649,7 @@ const settings = definePluginSettings({
     },
     prefetchOnStart: {
         type: OptionType.BOOLEAN,
-        description: "Download some favorites in the background after Discord starts",
+        description: "Download favorites in the background until the cache is full",
         default: true,
     },
     rewriteFavoriteSrc: {
@@ -2596,55 +2591,40 @@ async function prefetchFavorites() {
             refs = getFavoriteGifRefsFromFrecency();
         }
 
-        const targetBytes = prefetchTargetBytes(c.getMaxBytes());
+        const cap = c.getMaxBytes();
+        if (!Number.isFinite(cap) || cap <= 0) return;
+
         const newest = sortFavoritesNewestFirst(refs);
-        const queue: string[] = [];
         const seen = new Set<string>();
-        for (const ref of newest) {
-            const u = pickCacheableUrl(ref);
-            if (!u) continue;
-            const key = cacheKeyForUrl(u);
-            if (seen.has(key)) continue;
-            seen.add(key);
-            queue.push(u);
-        }
-        if (!queue.length) return;
-
-        const warmNewest = async () => {
-            for (const url of queue) {
-                try {
-                    await c.ensureBlobUrl(cacheKeyForUrl(url), { bumpUsage: false });
-                } catch {
-
-                }
-            }
-        };
-
-        if (c.bytes() >= targetBytes) {
-            await warmNewest();
-            return;
-        }
-
         let steps = 0;
-        for (const url of queue) {
-            if (c.bytes() >= targetBytes) break;
-            try {
-                const key = cacheKeyForUrl(url);
-                if (c.has(key) || c.has(url)) continue;
-                await ensureCached(c, url, { allowEvict: false, ...autoCacheOpts() });
 
-                steps += 1;
-                if (steps % 2 === 0) {
-                    await new Promise(r => setTimeout(r, 0));
+        for (const ref of newest) {
+            if (c.bytes() >= cap) break;
+            for (const u of [pickCacheableUrl(ref), ref.src, ref.url]) {
+                if (!u || !isLikelyGifMediaUrl(u) || isAutoCacheDenied(u)) continue;
+                const key = cacheKeyForUrl(u);
+                if (seen.has(key) || c.has(key) || c.has(u)) continue;
+                seen.add(key);
+                try {
+                    await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
+                } catch {
                 }
-            } catch {
-
+                if (c.bytes() >= cap) break;
+                steps += 1;
+                if (steps % 3 === 0) await new Promise(r => setTimeout(r, 0));
             }
         }
 
-        await warmNewest();
+        for (const ref of newest) {
+            const u = pickCacheableUrl(ref) || ref.src || ref.url;
+            if (!u) continue;
+            try {
+                await c.ensureBlobUrl(cacheKeyForUrl(u), { bumpUsage: false });
+            } catch {
+            }
+        }
+        scanPickerMedia();
     } catch {
-
     }
 }
 
