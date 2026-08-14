@@ -636,7 +636,6 @@ const KLIPY_MEDIA_HOSTS = [
     "media1.klipy.com",
     "media2.klipy.com",
     "c.klipy.com",
-    "klipy.com",
 ] as const;
 
 const ALL_ALLOWED_HOSTS = [
@@ -670,23 +669,39 @@ function hostAllowed(hostname: string): boolean {
     return false;
 }
 
-function isTenorUrl(url: string): boolean {
+function isTenorMediaHost(hostname: string): boolean {
+    const h = hostname.toLowerCase().replace(/\.$/, "");
+    return h === "media.tenor.com" || h === "c.tenor.com" || h.endsWith(".media.tenor.com");
+}
+
+function isDirectMediaUrl(url: string): boolean {
     try {
-        const h = new URL(url).hostname.toLowerCase().replace(/\.$/, "");
-        return h === "tenor.com" || h.endsWith(".tenor.com");
+        const u = new URL(url);
+        if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+        const h = u.hostname.toLowerCase().replace(/\.$/, "");
+        if (!hostAllowed(h)) return false;
+        const path = u.pathname.toLowerCase();
+        if (path.includes("/view/") || path.endsWith(".html")) return false;
+        if (/\.(gif|webp|png|jpe?g|mp4|webm|mov|m4v)$/i.test(path)) return true;
+        if (/\/(mp4|webm|gif|tinygif|nanogif|tinygifmax)(\/|$)/i.test(path)) return true;
+        if (h === "media.tenor.com" || h === "c.tenor.com") return true;
+        if (h.endsWith(".giphy.com") && h !== "giphy.com") return true;
+        if (h.endsWith(".klipy.com") && h !== "klipy.com") return true;
+        return false;
     } catch {
         return false;
     }
 }
 
 function tenorToKlipyFallbackUrls(url: string): string[] {
-    if (!isTenorUrl(url)) return [];
     let parsed: URL;
     try {
         parsed = new URL(url);
     } catch {
         return [];
     }
+    if (!isTenorMediaHost(parsed.hostname)) return [];
+    if (!isDirectMediaUrl(url)) return [];
 
     const out: string[] = [];
     const seen = new Set<string>();
@@ -695,10 +710,9 @@ function tenorToKlipyFallbackUrls(url: string): string[] {
             const u = new URL(parsed.href);
             u.hostname = host;
             u.protocol = "https:";
-            const href = u.href;
-            if (seen.has(href)) continue;
-            seen.add(href);
-            out.push(href);
+            if (seen.has(u.href)) continue;
+            seen.add(u.href);
+            out.push(u.href);
         } catch {
         }
     }
@@ -1187,13 +1201,7 @@ function keysForFavorite(ref: FavoriteGifRef) {
 function isLikelyGifMediaUrl(url: string) {
     if (!url || typeof url !== "string") return false;
     if (url.startsWith("blob:") || url.startsWith("data:")) return false;
-    try {
-        const u = new URL(url);
-        if (u.protocol !== "https:" && u.protocol !== "http:") return false;
-        return hostAllowed(u.hostname);
-    } catch {
-        return false;
-    }
+    return isDirectMediaUrl(url);
 }
 
 function isHeavyVideoUrl(url: string) {
@@ -1384,22 +1392,12 @@ function guessMime(url: string, contentType: string | null, data?: Uint8Array) {
     return "image/gif";
 }
 
-function isDownloadableUrl(url: string) {
-    try {
-        const u = new URL(url);
-        if (u.protocol !== "https:" && u.protocol !== "http:") return false;
-        return hostAllowed(u.hostname);
-    } catch {
-        return false;
-    }
-}
-
 async function downloadOneUrl(
     url: string,
-    fetchImpl: typeof fetch,
+    _fetchImpl: typeof fetch,
     maxBytes: number,
 ): Promise<{ data: Uint8Array; mime: string; } | null> {
-    if (!isDownloadableUrl(url)) return null;
+    if (!isDirectMediaUrl(url)) return null;
 
     const native = getPluginNative();
     if (native && typeof (native as any).fetchMedia === "function") {
@@ -1418,10 +1416,11 @@ async function downloadOneUrl(
             }
         } catch {
         }
+        return null;
     }
 
     try {
-        const res = await fetchImpl(url, {
+        const res = await _fetchImpl(url, {
             credentials: "omit",
             cache: "no-store",
             mode: "cors",
@@ -2459,7 +2458,7 @@ async function runWrapWork(job: {
     let downloads = 0;
     for (const ref of job.refs) {
         if (downloads >= 10) break;
-        for (const u of [ref.src, ref.url]) {
+        for (const u of [pickCacheableUrl(ref), ref.src, ref.url]) {
             if (!u || isAutoCacheDenied(u) || !isLikelyGifMediaUrl(u)) continue;
             const key = cacheKeyForUrl(u);
             if (!c.has(key) && !c.has(u) && downloads < 10) {
