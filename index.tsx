@@ -2101,8 +2101,10 @@ let emptyRetryCount = 0;
 let unsubSettings: (() => void) | null = null;
 let mediaErrorBound = false;
 let mediaObserver: MutationObserver | null = null;
+let lastFavorites: any[] = [];
 let wrapWork: Promise<void> | null = null;
 let wrapWorkPending: {
+    favorites: any[];
     refs: FavoriteGifRef[];
     visibleKeys: string[];
     newlyFavorited: string[];
@@ -2218,8 +2220,16 @@ function shouldCacheFavoriteUrl(url: string, _format?: number) {
 
 function pickCacheableUrl(ref: { src?: string; url?: string; format?: number; }): string | null {
     const candidates = [ref.src, ref.url].filter((u): u is string => !!u && typeof u === "string");
-    const nonVideo = candidates.filter(u => shouldCacheFavoriteUrl(u) && !isHeavyVideoUrl(u));
-    if (nonVideo.length) return nonVideo[0]!;
+    let format = ref.format;
+    if (typeof format !== "number" && ref.src && isHeavyVideoUrl(ref.src)) format = GIF_FORMAT_VIDEO;
+    if (format === GIF_FORMAT_VIDEO) {
+        const videos = candidates.filter(u => shouldCacheFavoriteUrl(u) && isHeavyVideoUrl(u));
+        if (videos.length) return videos[0]!;
+    }
+    if (format === GIF_FORMAT_IMAGE) {
+        const images = candidates.filter(u => shouldCacheFavoriteUrl(u) && !isHeavyVideoUrl(u));
+        if (images.length) return images[0]!;
+    }
     for (const u of candidates) {
         if (shouldCacheFavoriteUrl(u)) return u;
     }
@@ -2255,16 +2265,56 @@ function scheduleEmptyRetry(instance: any) {
     }, 150 + emptyRetryCount * 150);
 }
 
-function healStoreGif(gif: any) {
+function healStoreGif(gif: any, c: FavoriteGifCache | null = null) {
     if (!gif || typeof gif !== "object") return;
     healFavoriteUrls(gif);
     stashOriginalUrls(gif);
     const send = remoteSendUrl(gif);
     if (send && isRemoteHttpUrl(send)) gif.url = send;
     if (isBlobOrDataUrl(gif.src)) {
+        if (c?.isLiveBlobUrl(gif.src)) return;
         const cdn = remoteDisplaySrc(gif) || send;
         if (cdn) gif.src = cdn;
     }
+}
+
+function remoteCandidates(gif: any): string[] {
+    const out: string[] = [];
+    const push = (u: unknown) => {
+        if (typeof u === "string" && isRemoteHttpUrl(u) && !out.includes(u)) out.push(u);
+    };
+    push(gif?.__fgcOriginalSrc);
+    push(gif?.__fgcOriginalUrl);
+    if (!isBlobOrDataUrl(gif?.src)) push(gif?.src);
+    if (!isBlobOrDataUrl(gif?.url)) push(gif?.url);
+    push(remoteDisplaySrc(gif));
+    push(remoteSendUrl(gif));
+    return out;
+}
+
+function applyCacheSrc(gif: any, c: FavoriteGifCache | null): boolean {
+    healStoreGif(gif, c);
+    if (!c?.isInitialized() || !settings.store.rewriteFavoriteSrc) return false;
+    if (isBlobOrDataUrl(gif.src) && c.isLiveBlobUrl(gif.src)) return false;
+
+    let format = typeof gif.format === "number"
+        ? gif.format
+        : (typeof gif.__fgcOriginalFormat === "number" ? gif.__fgcOriginalFormat : undefined);
+    if (typeof format !== "number") {
+        const hint = gif.__fgcOriginalSrc || remoteDisplaySrc(gif);
+        format = hint && isHeavyVideoUrl(hint) ? GIF_FORMAT_VIDEO : GIF_FORMAT_IMAGE;
+    }
+
+    for (const remote of remoteCandidates(gif)) {
+        const hit = c.resolveDisplayHitSync(remote, { bumpUsage: false });
+        if (!hit?.blobUrl?.startsWith("blob:")) continue;
+        if (!c.isLiveBlobUrl(hit.blobUrl)) continue;
+        if (!mimeMatchesFormat(format, hit.mimeType)) continue;
+        if (gif.src === hit.blobUrl) return false;
+        gif.src = hit.blobUrl;
+        return true;
+    }
+    return false;
 }
 
 function refsFromFavorites(favorites: any[]): FavoriteGifRef[] {
@@ -2415,11 +2465,12 @@ function unbindMediaErrorHealer() {
 }
 
 function queueWrapWork(
+    favorites: any[],
     refs: FavoriteGifRef[],
     visibleKeys: string[],
     newlyFavorited: string[],
 ) {
-    wrapWorkPending = { refs, visibleKeys, newlyFavorited };
+    wrapWorkPending = { favorites, refs, visibleKeys, newlyFavorited };
     if (wrapWork) return;
     wrapWork = (async () => {
         try {
@@ -2435,6 +2486,7 @@ function queueWrapWork(
 }
 
 async function runWrapWork(job: {
+    favorites: any[];
     refs: FavoriteGifRef[];
     visibleKeys: string[];
     newlyFavorited: string[];
@@ -2448,6 +2500,7 @@ async function runWrapWork(job: {
         if (c.has(key) && !c.hasResidentData(key)) await c.hydrate(key);
         if (c.hasResidentData(key)) c.ensureBlobUrlSync(key, { bumpUsage: false });
     }
+    for (const g of job.favorites) applyCacheSrc(g, c);
     scanPickerMedia();
 
     for (const u of job.newlyFavorited) {
@@ -2475,6 +2528,7 @@ async function runWrapWork(job: {
             }
         }
     }
+    for (const g of job.favorites) applyCacheSrc(g, c);
     scanPickerMedia();
 }
 
@@ -2546,6 +2600,31 @@ async function manualRemoveFromCache(url: string) {
     safeForceUpdate(lastPickerInstance);
 }
 
+async function warmCachedFavoriteBlobs() {
+    try {
+        const c = getCache();
+        await c.init();
+        let refs = getFavoriteGifRefsFromFrecency();
+        if (!refs.length) {
+            requestFavoriteGifsLoad();
+            refs = getFavoriteGifRefsFromFrecency();
+        }
+        if (refs.length) refreshFavoriteSet(refs);
+        const keys = pinKeysForRefs(refs);
+        c.setDisplayPinnedKeys(keys);
+        for (const key of keys) {
+            if (!c.has(key)) continue;
+            try {
+                await c.ensureBlobUrl(key, { bumpUsage: false });
+            } catch {
+            }
+        }
+        for (const g of lastFavorites) applyCacheSrc(g, c);
+        scanPickerMedia();
+    } catch {
+    }
+}
+
 async function prefetchFavorites() {
     try {
         const c = getCache();
@@ -2573,7 +2652,7 @@ async function prefetchFavorites() {
         if (!queue.length) return;
 
         const warmNewest = async () => {
-            for (const url of queue.slice(0, PREFETCH_WARM_NEWEST)) {
+            for (const url of queue) {
                 try {
                     await c.ensureBlobUrl(cacheKeyForUrl(url), { bumpUsage: false });
                 } catch {
@@ -2732,15 +2811,17 @@ export default definePlugin({
                 return favorites;
             }
             emptyRetryCount = 0;
+            lastFavorites = favorites;
 
-            for (const g of favorites) healStoreGif(g);
+            const c = getCache();
+            const ready = c.isInitialized() ? c : null;
+            for (const g of favorites) applyCacheSrc(g, ready);
 
             const refs = refsFromFavorites(favorites);
             const newlyFavorited = refreshFavoriteSet(refs);
             const visibleKeys = pinKeysForRefs(refs);
-            const c = getCache();
             c.setDisplayPinnedKeys(visibleKeys);
-            queueWrapWork(refs, visibleKeys, newlyFavorited);
+            queueWrapWork(favorites, refs, visibleKeys, newlyFavorited);
             scanPickerMedia();
             return favorites;
         } catch {
@@ -2771,11 +2852,12 @@ export default definePlugin({
             refreshFavoriteSet();
             bindMediaErrorHealer();
             ensureMediaObserver();
+            void warmCachedFavoriteBlobs();
 
             const onSettings = () => {
                 const refs = getFavoriteGifRefsFromFrecency();
                 if (refs.length) refreshFavoriteSet(refs);
-                scanPickerMedia();
+                void warmCachedFavoriteBlobs();
                 safeForceUpdate(lastPickerInstance);
             };
             try {
@@ -2826,6 +2908,7 @@ export default definePlugin({
         favoriteUrlSet = new Set();
         favoritesSeeded = false;
         lastPickerInstance = null;
+        lastFavorites = [];
         emptyRetryCount = 0;
     },
 });
