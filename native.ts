@@ -155,17 +155,47 @@ export async function fetchMedia(
 
         if (!res.ok) return null;
 
+        const cap = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_MAX_DOWNLOAD;
         const lenHeader = res.headers.get("content-length");
         if (lenHeader) {
             const len = Number(lenHeader);
-            if (Number.isFinite(len) && len > maxBytes) return null;
+            if (Number.isFinite(len) && len > cap) return null;
         }
 
-        const buf = await res.arrayBuffer();
-        if (!buf.byteLength || buf.byteLength > maxBytes) return null;
+        const body = res.body;
+        let data: ArrayBuffer;
+        if (body && typeof body.getReader === "function") {
+            const reader = body.getReader();
+            const chunks: Uint8Array[] = [];
+            let total = 0;
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (!value) continue;
+                total += value.byteLength;
+                if (total > cap) {
+                    try { await reader.cancel(); } catch { }
+                    return null;
+                }
+                chunks.push(value);
+            }
+            const out = new Uint8Array(total);
+            let off = 0;
+            for (const chunk of chunks) {
+                out.set(chunk, off);
+                off += chunk.byteLength;
+            }
+            data = out.buffer;
+        } else {
+            const buf = await res.arrayBuffer();
+            if (!buf.byteLength || buf.byteLength > cap) return null;
+            data = buf;
+        }
+
+        if (!data.byteLength || data.byteLength > cap) return null;
 
         const type = (res.headers.get("content-type") || "application/octet-stream").split(";")[0]!.trim();
-        return { data: buf, type };
+        return { data, type };
     }
 
     return null;
@@ -189,29 +219,46 @@ export async function ensureCacheDir(_e: unknown, dir: string) {
     return true;
 }
 
+function readOneEntry(
+    dir: string,
+    key: string,
+    info: { file?: string; mimeType?: string; useCount?: number; lastUsed?: number; createdAt?: number; size?: number; },
+): NativeCacheRecord | null {
+    try {
+        const name = isSafeBlobFileName(info.file || "") ? info.file! : fileNameForKey(key);
+        const file = resolveBlobPath(dir, name);
+        if (!file || !existsSync(file)) return null;
+        const buf = readFileSync(file);
+        const data = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+        return {
+            key,
+            data,
+            mimeType: info.mimeType || "application/octet-stream",
+            useCount: Number(info.useCount) || 0,
+            lastUsed: Number(info.lastUsed) || 0,
+            createdAt: Number(info.createdAt) || 0,
+            size: typeof info.size === "number" ? info.size : buf.byteLength,
+        };
+    } catch {
+        return null;
+    }
+}
+
+export async function getEntry(_e: unknown, dir: string, key: string): Promise<NativeCacheRecord | null> {
+    await ensureCacheDir(_e, dir);
+    const info = readMeta(dir)[key];
+    if (!info) return null;
+    return readOneEntry(dir, key, info);
+}
+
 export async function loadAllEntries(_e: unknown, dir: string): Promise<NativeCacheRecord[]> {
     await ensureCacheDir(_e, dir);
     const meta = readMeta(dir);
     const out: NativeCacheRecord[] = [];
 
     for (const [key, info] of Object.entries(meta)) {
-        try {
-            const name = isSafeBlobFileName(info.file) ? info.file : fileNameForKey(key);
-            const file = resolveBlobPath(dir, name);
-            if (!file || !existsSync(file)) continue;
-            const buf = readFileSync(file);
-            const data = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-            out.push({
-                key,
-                data,
-                mimeType: info.mimeType || "application/octet-stream",
-                useCount: Number(info.useCount) || 0,
-                lastUsed: Number(info.lastUsed) || 0,
-                createdAt: Number(info.createdAt) || 0,
-                size: typeof info.size === "number" ? info.size : buf.byteLength,
-            });
-        } catch {
-        }
+        const row = readOneEntry(dir, key, info);
+        if (row) out.push(row);
     }
     return out;
 }
