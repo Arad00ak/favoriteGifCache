@@ -1935,6 +1935,7 @@ const pendingAddRefs = new Map<string, FavoriteGifRef>();
 const pendingRemoveKeys = new Set<string>();
 let favoriteDiffFlush: Promise<void> | null = null;
 let favoritePoll: ReturnType<typeof setInterval> | null = null;
+let prefetchRunning = false;
 let wrapWork: Promise<void> | null = null;
 let wrapWorkPending: {
     favorites: any[];
@@ -2057,6 +2058,7 @@ function syncFromFrecency() {
     if (!refs.length) return;
     const { added, removed } = refreshFavoriteSet(refs);
     enqueueFavoriteDiff(added, removed, refs);
+    kickPrefetch();
 }
 
 function hookFavoriteUpdates() {
@@ -2579,25 +2581,31 @@ async function warmCachedFavoriteBlobs() {
     }
 }
 
+function kickPrefetch() {
+    if (settings.store.prefetchOnStart === false) return;
+    if (prefetchRunning) return;
+    void prefetchFavorites();
+}
+
 async function prefetchFavorites() {
+    if (prefetchRunning) return;
+    prefetchRunning = true;
     try {
         const c = getCache();
         await c.init();
-        refreshFavoriteSet();
-        let refs = getFavoriteGifRefsFromFrecency();
+        requestFavoriteGifsLoad();
+        const refs = getFavoriteGifRefsFromFrecency();
+        if (!refs.length) return;
 
-        if (!refs.length) {
-            await new Promise(r => setTimeout(r, 2000));
-            refs = getFavoriteGifRefsFromFrecency();
-        }
-
+        refreshFavoriteSet(refs);
         const cap = c.getMaxBytes();
         if (!Number.isFinite(cap) || cap <= 0) return;
 
         const newest = sortFavoritesNewestFirst(refs);
+        console.info("[FavoriteGifCache] bg fill", newest.length, "used", c.bytes(), "/", cap);
+
         const seen = new Set<string>();
         let steps = 0;
-
         for (const ref of newest) {
             if (c.bytes() >= cap) break;
             for (const u of [pickCacheableUrl(ref), ref.src, ref.url]) {
@@ -2623,8 +2631,11 @@ async function prefetchFavorites() {
             } catch {
             }
         }
+        console.info("[FavoriteGifCache] bg fill done", c.bytes(), "/", cap);
         scanPickerMedia();
     } catch {
+    } finally {
+        prefetchRunning = false;
     }
 }
 
@@ -2762,6 +2773,7 @@ export default definePlugin({
             const visibleKeys = pinKeysForRefs(refs);
             c.setDisplayPinnedKeys(visibleKeys);
             queueWrapWork(favorites, refs, visibleKeys);
+            kickPrefetch();
             scanPickerMedia();
             return favorites;
         } catch {
@@ -2814,12 +2826,7 @@ export default definePlugin({
             }
 
             if (settings.store.prefetchOnStart) {
-                prefetchTimer = setTimeout(() => {
-                    void prefetchFavorites().then(() => {
-                        scanPickerMedia();
-                        setTimeout(() => void prefetchFavorites().then(() => scanPickerMedia()), 8000);
-                    });
-                }, 800);
+                prefetchTimer = setTimeout(() => kickPrefetch(), 1000);
             }
         } catch (e) {
             console.error("[FavoriteGifCache] failed to start", e);
@@ -2858,6 +2865,7 @@ export default definePlugin({
         lastPickerInstance = null;
         lastFavorites = [];
         emptyRetryCount = 0;
+        prefetchRunning = false;
     },
 });
 
