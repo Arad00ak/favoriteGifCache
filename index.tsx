@@ -2106,6 +2106,10 @@ let unsubSettings: (() => void) | null = null;
 let mediaErrorBound = false;
 let mediaObserver: MutationObserver | null = null;
 let lastFavorites: any[] = [];
+const pendingAddRefs = new Map<string, FavoriteGifRef>();
+const pendingRemoveKeys = new Set<string>();
+let favoriteDiffFlush: Promise<void> | null = null;
+let favoritePoll: ReturnType<typeof setInterval> | null = null;
 let wrapWork: Promise<void> | null = null;
 let wrapWorkPending: {
     favorites: any[];
@@ -2177,7 +2181,7 @@ settingsHooks.onSmartEvictionChange = () => {
 };
 settingsHooks.onCacheDirectoryChange = () => { void rebuildCache(); };
 
-function refreshFavoriteSet(refs?: FavoriteGifRef[]): string[] {
+function refreshFavoriteSet(refs?: FavoriteGifRef[]): { added: string[]; removed: string[]; } {
     const list = refs ?? getFavoriteGifRefsFromFrecency();
     const next = new Set<string>();
     const primaryByKey = new Map<string, string>();
@@ -2192,7 +2196,8 @@ function refreshFavoriteSet(refs?: FavoriteGifRef[]): string[] {
         }
     }
 
-    const newlyAddedUrls: string[] = [];
+    const added: string[] = [];
+    const removed: string[] = [];
     if (favoritesSeeded) {
         const seenPrimary = new Set<string>();
         for (const key of next) {
@@ -2200,14 +2205,102 @@ function refreshFavoriteSet(refs?: FavoriteGifRef[]): string[] {
             const primary = primaryByKey.get(key);
             if (!primary || seenPrimary.has(primary)) continue;
             seenPrimary.add(primary);
-            newlyAddedUrls.push(primary);
+            added.push(primary);
+        }
+        for (const key of favoriteUrlSet) {
+            if (!next.has(key)) removed.push(key);
         }
     }
 
     favoriteUrlSet = next;
     favoritesSeeded = true;
     getCache().setProtectedKeys(next);
-    return newlyAddedUrls;
+    return { added, removed };
+}
+
+function enqueueFavoriteDiff(added: string[], removed: string[], refs: FavoriteGifRef[]) {
+    for (const ref of newRefsForUrls(added, refs)) {
+        const id = (isRemoteHttpUrl(ref.url) ? ref.url : "") || ref.src || "";
+        if (id) pendingAddRefs.set(id, ref);
+    }
+    for (const key of removed) pendingRemoveKeys.add(key);
+    if (pendingAddRefs.size || pendingRemoveKeys.size) void flushFavoriteDiff();
+}
+
+function syncFromFrecency() {
+    hookFavoriteUpdates();
+    const refs = getFavoriteGifRefsFromFrecency();
+    if (!refs.length) return;
+    const { added, removed } = refreshFavoriteSet(refs);
+    enqueueFavoriteDiff(added, removed, refs);
+}
+
+function hookFavoriteUpdates() {
+    try {
+        const ac = UserSettingsActionCreators?.FrecencyUserSettingsActionCreators;
+        if (!ac || (ac as any).__fgcHooked) return;
+        const orig = ac.updateAsync;
+        if (typeof orig !== "function") return;
+        (ac as any).__fgcHooked = true;
+        ac.updateAsync = function (this: any, key: string, ...rest: any[]) {
+            const ret = orig.call(this, key, ...rest);
+            if (key === "favoriteGifs") {
+                const after = () => {
+                    try { syncFromFrecency(); } catch { }
+                };
+                if (ret && typeof (ret as Promise<unknown>).then === "function") {
+                    (ret as Promise<unknown>).then(after, after);
+                } else {
+                    queueMicrotask(after);
+                }
+                setTimeout(after, 0);
+                setTimeout(after, 300);
+            }
+            return ret;
+        };
+    } catch {
+    }
+}
+
+async function flushFavoriteDiff() {
+    if (favoriteDiffFlush) return favoriteDiffFlush;
+    favoriteDiffFlush = (async () => {
+        try {
+            while (pendingAddRefs.size || pendingRemoveKeys.size) {
+                const adds = [...pendingAddRefs.values()];
+                pendingAddRefs.clear();
+                const removes = [...pendingRemoveKeys];
+                pendingRemoveKeys.clear();
+                if (adds.length) await cacheNewFavoriteRefs(adds);
+                if (removes.length) await evictUnfavoritedKeys(removes);
+            }
+        } finally {
+            favoriteDiffFlush = null;
+        }
+    })();
+    return favoriteDiffFlush;
+}
+
+async function evictUnfavoritedKeys(keys: string[]) {
+    if (!keys.length) return;
+    try {
+        const c = getCache();
+        await c.init();
+        const drop = new Set<string>();
+        for (const k of keys) {
+            if (!k) continue;
+            drop.add(k);
+            drop.add(cacheKeyForUrl(k));
+            for (const alt of mediaLookupKeys(k)) drop.add(alt);
+        }
+        for (const key of c.keys()) {
+            if (!drop.has(key)) continue;
+            if (favoriteUrlSet.has(key)) continue;
+            try { await c.delete(key); } catch { }
+        }
+        scanPickerMedia();
+    } catch {
+    }
 }
 
 function isTrackedFavorite(url: string) {
@@ -2243,12 +2336,21 @@ async function cacheNewFavoriteRefs(refs: FavoriteGifRef[]) {
         const c = getCache();
         await c.init();
         for (const ref of refs) {
-            const cacheUrl = pickCacheableUrl(ref);
-            if (!cacheUrl || isAutoCacheDenied(cacheUrl) || !shouldCacheFavoriteUrl(cacheUrl)) continue;
-            try {
-                await cacheOnUserAction(c, cacheUrl, fetch, autoCacheOpts());
-                await c.ensureBlobUrl(cacheKeyForUrl(cacheUrl), { bumpUsage: false });
-            } catch {
+            const tried = new Set<string>();
+            const urls = [pickCacheableUrl(ref), ref.src, ref.url];
+            for (const cacheUrl of urls) {
+                if (!cacheUrl || !shouldCacheFavoriteUrl(cacheUrl) || isAutoCacheDenied(cacheUrl)) continue;
+                const key = cacheKeyForUrl(cacheUrl);
+                if (tried.has(key)) continue;
+                tried.add(key);
+                try {
+                    const res = await cacheOnUserAction(c, cacheUrl, fetch, autoCacheOpts());
+                    if (res?.stored || c.has(key) || c.has(cacheUrl)) {
+                        await c.ensureBlobUrl(key, { bumpUsage: false });
+                        break;
+                    }
+                } catch {
+                }
             }
         }
         for (const g of lastFavorites) applyCacheSrc(g, c);
@@ -2871,10 +2973,11 @@ export default definePlugin({
             for (const g of favorites) applyCacheSrc(g, ready);
 
             const refs = refsFromFavorites(favorites);
-            const newlyFavorited = refreshFavoriteSet(refs);
+            const { added } = refreshFavoriteSet(refs);
+            enqueueFavoriteDiff(added, [], refs);
             const visibleKeys = pinKeysForRefs(refs);
             c.setDisplayPinnedKeys(visibleKeys);
-            queueWrapWork(favorites, refs, visibleKeys, newlyFavorited);
+            queueWrapWork(favorites, refs, visibleKeys, added);
             scanPickerMedia();
             return favorites;
         } catch {
@@ -2903,15 +3006,17 @@ export default definePlugin({
 
             requestFavoriteGifsLoad();
             refreshFavoriteSet();
+            hookFavoriteUpdates();
             bindMediaErrorHealer();
             ensureMediaObserver();
             void warmCachedFavoriteBlobs();
+            if (favoritePoll) clearInterval(favoritePoll);
+            favoritePoll = setInterval(() => {
+                try { syncFromFrecency(); } catch { }
+            }, 2000);
 
             const onSettings = () => {
-                const refs = getFavoriteGifRefsFromFrecency();
-                if (!refs.length) return;
-                const added = refreshFavoriteSet(refs);
-                if (added.length) void cacheNewFavoriteRefs(newRefsForUrls(added, refs));
+                syncFromFrecency();
                 void warmCachedFavoriteBlobs();
             };
             try {
@@ -2955,6 +3060,12 @@ export default definePlugin({
             unsubSettings();
             unsubSettings = null;
         }
+        if (favoritePoll) {
+            clearInterval(favoritePoll);
+            favoritePoll = null;
+        }
+        pendingAddRefs.clear();
+        pendingRemoveKeys.clear();
         unbindMediaErrorHealer();
         wrapWorkPending = null;
         cache = null;
