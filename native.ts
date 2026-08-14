@@ -155,17 +155,47 @@ export async function fetchMedia(
 
         if (!res.ok) return null;
 
+        const cap = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_MAX_DOWNLOAD;
         const lenHeader = res.headers.get("content-length");
         if (lenHeader) {
             const len = Number(lenHeader);
-            if (Number.isFinite(len) && len > maxBytes) return null;
+            if (Number.isFinite(len) && len > cap) return null;
         }
 
-        const buf = await res.arrayBuffer();
-        if (!buf.byteLength || buf.byteLength > maxBytes) return null;
+        const body = res.body;
+        let data: ArrayBuffer;
+        if (body && typeof body.getReader === "function") {
+            const reader = body.getReader();
+            const chunks: Uint8Array[] = [];
+            let total = 0;
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (!value) continue;
+                total += value.byteLength;
+                if (total > cap) {
+                    try { await reader.cancel(); } catch { }
+                    return null;
+                }
+                chunks.push(value);
+            }
+            const out = new Uint8Array(total);
+            let off = 0;
+            for (const chunk of chunks) {
+                out.set(chunk, off);
+                off += chunk.byteLength;
+            }
+            data = out.buffer;
+        } else {
+            const buf = await res.arrayBuffer();
+            if (!buf.byteLength || buf.byteLength > cap) return null;
+            data = buf;
+        }
+
+        if (!data.byteLength || data.byteLength > cap) return null;
 
         const type = (res.headers.get("content-type") || "application/octet-stream").split(";")[0]!.trim();
-        return { data: buf, type };
+        return { data, type };
     }
 
     return null;
