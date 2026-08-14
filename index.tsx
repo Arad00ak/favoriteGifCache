@@ -516,6 +516,15 @@ class FileStorageBackend implements StorageBackend {
         private readonly dir: string,
         private readonly api: {
             ensureCacheDir(dir: string): Promise<unknown>;
+            getEntry(dir: string, key: string): Promise<{
+                key: string;
+                data: ArrayBuffer;
+                mimeType: string;
+                useCount: number;
+                lastUsed: number;
+                createdAt: number;
+                size: number;
+            } | null>;
             loadAllEntries(dir: string): Promise<Array<{
                 key: string;
                 data: ArrayBuffer;
@@ -564,6 +573,13 @@ class FileStorageBackend implements StorageBackend {
     }
 
     async get(key: string) {
+        try {
+            if (typeof this.api.getEntry === "function") {
+                const row = await this.api.getEntry(this.dir, key);
+                return row ? toEntry(row) : null;
+            }
+        } catch {
+        }
         const all = await this.getAll();
         return all.find(e => e.key === key) ?? null;
     }
@@ -701,8 +717,13 @@ function mediaDownloadCandidates(url: string): string[] {
     return out;
 }
 
+const lookupMemo = new Map<string, string[]>();
+
 function mediaLookupKeys(url: string): string[] {
     if (!url) return [];
+    const hit = lookupMemo.get(url);
+    if (hit) return hit;
+
     const keys: string[] = [];
     const seen = new Set<string>();
     const add = (k: string) => {
@@ -714,22 +735,13 @@ function mediaLookupKeys(url: string): string[] {
     add(url);
     try {
         const u = new URL(url);
-        if (hostAllowed(u.hostname)) {
-            add(`${u.origin}${u.pathname}`);
-        }
+        if (hostAllowed(u.hostname)) add(`${u.origin}${u.pathname}`);
         add(u.href);
     } catch {
     }
 
-    for (const alt of tenorToKlipyFallbackUrls(url)) {
-        add(alt);
-        try {
-            const u = new URL(alt);
-            add(`${u.origin}${u.pathname}`);
-        } catch {
-        }
-    }
-
+    if (lookupMemo.size > 1500) lookupMemo.clear();
+    lookupMemo.set(url, keys);
     return keys;
 }
 
@@ -795,6 +807,7 @@ class FavoriteGifCache {
     private ready: Promise<void> | null = null;
     private initDone = false;
     private blobUrls = new Map<string, string>();
+    private liveBlobs = new Set<string>();
     private metaPersistQueue = new Map<string, ReturnType<typeof setTimeout>>();
     private revokeListener: ((blobUrl: string) => void) | null = null;
 
@@ -822,10 +835,7 @@ class FavoriteGifCache {
                 await this.backend.open();
                 const all = await this.backend.getAll();
 
-                for (const entry of all) {
-                    this.core.loadEntry(entry);
-                    this.core.ensureSoftMemory();
-                }
+                for (const entry of all) this.core.loadEntry(entry);
 
                 const before = new Set(this.core.keys());
                 const removed = this.core.setMaxBytes(this.core.getMaxBytes());
@@ -907,19 +917,6 @@ class FavoriteGifCache {
         return this.core.peek(key);
     }
 
-    async peek(key: string) {
-        await this.init();
-        if (this.core.needsHydrate(key)) await this.hydrate(key);
-        return this.core.peek(key);
-    }
-
-    async get(key: string) {
-        await this.init();
-        if (this.core.needsHydrate(key)) await this.hydrate(key);
-        const entry = this.core.get(key);
-        return entry && entry.data.byteLength > 0 ? entry : null;
-    }
-
     touchSync(key: string) {
         if (!this.core.touch(key)) return false;
         const entry = this.core.peekRef(key);
@@ -944,12 +941,10 @@ class FavoriteGifCache {
         }
 
         if (result.stored) {
-            const stored = this.core.peek(key);
+            const stored = this.core.peekRef(key);
             if (stored && stored.data.byteLength > 0) {
                 await this.backend.put(stored);
-                if (!this.blobUrls.has(key)) {
-                    this.ensureBlobUrlSync(key, { bumpUsage: false });
-                }
+                if (!this.blobUrls.has(key)) this.ensureBlobUrlSync(key, { bumpUsage: false });
             }
         }
 
@@ -999,6 +994,7 @@ class FavoriteGifCache {
             if (blob.size <= 0) return null;
             const url = URL.createObjectURL(blob);
             this.blobUrls.set(key, url);
+            this.liveBlobs.add(url);
             if (mime && mime !== entry.mimeType) entry.mimeType = mime;
             return url;
         } catch {
@@ -1044,11 +1040,7 @@ class FavoriteGifCache {
     }
 
     isLiveBlobUrl(blobUrl: string) {
-        if (!blobUrl || !blobUrl.startsWith("blob:")) return false;
-        for (const u of this.blobUrls.values()) {
-            if (u === blobUrl) return true;
-        }
-        return false;
+        return !!blobUrl && this.liveBlobs.has(blobUrl);
     }
 
     private scheduleMetaPersist(entry: CacheEntry) {
@@ -1060,7 +1052,7 @@ class FavoriteGifCache {
 
         const t = setTimeout(() => {
             this.metaPersistQueue.delete(entry.key);
-            const latest = this.core.peek(entry.key);
+            const latest = this.core.peekRef(entry.key);
             if (!latest || (latest.data.byteLength === 0 && latest.size > 0)) return;
             void this.backend.put(latest).catch(() => {});
         }, 50);
@@ -1070,15 +1062,10 @@ class FavoriteGifCache {
     private revokeBlob(key: string) {
         const url = this.blobUrls.get(key);
         if (url) {
-            try {
-                this.revokeListener?.(url);
-            } catch {
-            }
+            this.liveBlobs.delete(url);
+            try { this.revokeListener?.(url); } catch { }
             if (typeof URL !== "undefined" && URL.revokeObjectURL) {
-                try {
-                    URL.revokeObjectURL(url);
-                } catch {
-                }
+                try { URL.revokeObjectURL(url); } catch { }
             }
         }
         this.blobUrls.delete(key);
@@ -2084,19 +2071,15 @@ function hookFavoriteUpdates() {
         const orig = ac.updateAsync;
         if (typeof orig !== "function") return;
         (ac as any).__fgcHooked = true;
+        let hookTimer: ReturnType<typeof setTimeout> | null = null;
         ac.updateAsync = function (this: any, key: string, ...rest: any[]) {
             const ret = orig.call(this, key, ...rest);
             if (key === "favoriteGifs") {
-                const after = () => {
+                if (hookTimer) clearTimeout(hookTimer);
+                hookTimer = setTimeout(() => {
+                    hookTimer = null;
                     try { syncFromFrecency(); } catch { }
-                };
-                if (ret && typeof (ret as Promise<unknown>).then === "function") {
-                    (ret as Promise<unknown>).then(after, after);
-                } else {
-                    queueMicrotask(after);
-                }
-                setTimeout(after, 0);
-                setTimeout(after, 300);
+                }, 50);
             }
             return ret;
         };
@@ -2152,10 +2135,6 @@ function isTrackedFavorite(url: string) {
     return favoriteUrlSet.has(url) || favoriteUrlSet.has(cacheKeyForUrl(url));
 }
 
-function shouldCacheFavoriteUrl(url: string) {
-    return !!url && isLikelyGifMediaUrl(url);
-}
-
 function newRefsForUrls(urls: string[], refs: FavoriteGifRef[]): FavoriteGifRef[] {
     if (!urls.length) return [];
     const want = new Set<string>();
@@ -2179,7 +2158,7 @@ async function cacheNewFavoriteRefs(refs: FavoriteGifRef[]) {
             const tried = new Set<string>();
             const urls = [pickCacheableUrl(ref), ref.src, ref.url];
             for (const cacheUrl of urls) {
-                if (!cacheUrl || !shouldCacheFavoriteUrl(cacheUrl) || isAutoCacheDenied(cacheUrl)) continue;
+                if (!cacheUrl || !isLikelyGifMediaUrl(cacheUrl) || isAutoCacheDenied(cacheUrl)) continue;
                 const key = cacheKeyForUrl(cacheUrl);
                 if (tried.has(key)) continue;
                 tried.add(key);
@@ -2204,15 +2183,15 @@ function pickCacheableUrl(ref: { src?: string; url?: string; format?: number; })
     let format = ref.format;
     if (typeof format !== "number" && ref.src && isHeavyVideoUrl(ref.src)) format = GIF_FORMAT_VIDEO;
     if (format === GIF_FORMAT_VIDEO) {
-        const videos = candidates.filter(u => shouldCacheFavoriteUrl(u) && isHeavyVideoUrl(u));
+        const videos = candidates.filter(u => isLikelyGifMediaUrl(u) && isHeavyVideoUrl(u));
         if (videos.length) return videos[0]!;
     }
     if (format === GIF_FORMAT_IMAGE) {
-        const images = candidates.filter(u => shouldCacheFavoriteUrl(u) && !isHeavyVideoUrl(u));
+        const images = candidates.filter(u => isLikelyGifMediaUrl(u) && !isHeavyVideoUrl(u));
         if (images.length) return images[0]!;
     }
     for (const u of candidates) {
-        if (shouldCacheFavoriteUrl(u)) return u;
+        if (isLikelyGifMediaUrl(u)) return u;
     }
     return null;
 }
@@ -2291,9 +2270,7 @@ function applyCacheSrc(gif: any, c: FavoriteGifCache | null): boolean {
 
     for (const remote of remoteCandidates(gif)) {
         const hit = c.resolveDisplayHitSync(remote, { bumpUsage: false });
-        if (!hit?.blobUrl?.startsWith("blob:")) continue;
-        if (!c.isLiveBlobUrl(hit.blobUrl)) continue;
-        if (!mimeMatchesFormat(format, hit.mimeType)) continue;
+        if (!hit?.blobUrl?.startsWith("blob:") || !mimeMatchesFormat(format, hit.mimeType)) continue;
         if (gif.src === hit.blobUrl) return false;
         gif.src = hit.blobUrl;
         return true;
@@ -2377,7 +2354,7 @@ function maybeSwapMedia(el: HTMLImageElement | HTMLVideoElement) {
         const c = cache;
         if (!c?.isInitialized()) return;
         const hit = c.resolveDisplayHitSync(src, { bumpUsage: false });
-        if (!hit?.blobUrl?.startsWith("blob:") || !c.isLiveBlobUrl(hit.blobUrl)) return;
+        if (!hit?.blobUrl?.startsWith("blob:")) return;
 
         const videoEl = el.tagName === "VIDEO";
         if (videoEl && !isVideoMime(hit.mimeType)) return;
@@ -2396,7 +2373,7 @@ function scanPickerMedia() {
     scanTimer = setTimeout(() => {
         scanTimer = null;
         try {
-            for (const node of document.querySelectorAll("img,video")) {
+            for (const node of document.querySelectorAll("img[src^=\"http\"],video[src^=\"http\"]")) {
                 maybeSwapMedia(node as HTMLImageElement | HTMLVideoElement);
             }
         } catch {
@@ -2486,7 +2463,7 @@ async function runWrapWork(job: {
     for (const ref of job.refs) {
         if (downloads >= 10) break;
         for (const u of [ref.src, ref.url]) {
-            if (!u || isAutoCacheDenied(u) || !shouldCacheFavoriteUrl(u)) continue;
+            if (!u || isAutoCacheDenied(u) || !isLikelyGifMediaUrl(u)) continue;
             const key = cacheKeyForUrl(u);
             if (!c.has(key) && !c.has(u) && downloads < 10) {
                 await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
@@ -2840,7 +2817,7 @@ export default definePlugin({
             if (favoritePoll) clearInterval(favoritePoll);
             favoritePoll = setInterval(() => {
                 try { syncFromFrecency(); } catch { }
-            }, 2000);
+            }, 4000);
 
             const onSettings = () => {
                 syncFromFrecency();
