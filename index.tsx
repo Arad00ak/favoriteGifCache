@@ -2183,7 +2183,8 @@ function refreshFavoriteSet(refs?: FavoriteGifRef[]): string[] {
     const primaryByKey = new Map<string, string>();
 
     for (const ref of list) {
-        const primary = ref.src || ref.url;
+        const primary = (isRemoteHttpUrl(ref.src) ? ref.src : "")
+            || (isRemoteHttpUrl(ref.url) ? ref.url : "");
         if (!primary) continue;
         for (const k of keysForFavorite(ref)) {
             next.add(k);
@@ -2220,6 +2221,40 @@ function shouldCacheFavoriteUrl(url: string, _format?: number) {
     if (!url || url.startsWith("blob:") || url.startsWith("data:")) return false;
 
     return isCacheableFavoriteUrl(url) || isLikelyGifMediaUrl(url);
+}
+
+function newRefsForUrls(urls: string[], refs: FavoriteGifRef[]): FavoriteGifRef[] {
+    if (!urls.length) return [];
+    const want = new Set<string>();
+    for (const u of urls) {
+        if (!u) continue;
+        want.add(u);
+        want.add(cacheKeyForUrl(u));
+        for (const k of mediaLookupKeys(u)) want.add(k);
+    }
+    return refs.filter(ref =>
+        [ref.src, ref.url].some(u => !!u && (want.has(u) || want.has(cacheKeyForUrl(u)))),
+    );
+}
+
+async function cacheNewFavoriteRefs(refs: FavoriteGifRef[]) {
+    if (!refs.length) return;
+    try {
+        const c = getCache();
+        await c.init();
+        for (const ref of refs) {
+            const cacheUrl = pickCacheableUrl(ref);
+            if (!cacheUrl || isAutoCacheDenied(cacheUrl) || !shouldCacheFavoriteUrl(cacheUrl)) continue;
+            try {
+                await cacheOnUserAction(c, cacheUrl, fetch, autoCacheOpts());
+                await c.ensureBlobUrl(cacheKeyForUrl(cacheUrl), { bumpUsage: false });
+            } catch {
+            }
+        }
+        for (const g of lastFavorites) applyCacheSrc(g, c);
+        scanPickerMedia();
+    } catch {
+    }
 }
 
 function pickCacheableUrl(ref: { src?: string; url?: string; format?: number; }): string | null {
@@ -2512,15 +2547,7 @@ async function runWrapWork(job: {
     for (const g of job.favorites) applyCacheSrc(g, c);
     scanPickerMedia();
 
-    for (const u of job.newlyFavorited) {
-        const cacheUrl = pickCacheableUrl({ src: u, url: u });
-        if (!cacheUrl || isAutoCacheDenied(cacheUrl)) continue;
-        try {
-            await cacheOnUserAction(c, cacheUrl, fetch, autoCacheOpts());
-            await c.ensureBlobUrl(cacheKeyForUrl(cacheUrl), { bumpUsage: false });
-        } catch {
-        }
-    }
+    await cacheNewFavoriteRefs(newRefsForUrls(job.newlyFavorited, job.refs));
 
     let downloads = 0;
     for (const ref of job.refs) {
@@ -2882,7 +2909,9 @@ export default definePlugin({
 
             const onSettings = () => {
                 const refs = getFavoriteGifRefsFromFrecency();
-                if (refs.length) refreshFavoriteSet(refs);
+                if (!refs.length) return;
+                const added = refreshFavoriteSet(refs);
+                if (added.length) void cacheNewFavoriteRefs(newRefsForUrls(added, refs));
                 void warmCachedFavoriteBlobs();
             };
             try {
