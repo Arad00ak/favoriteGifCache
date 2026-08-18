@@ -128,6 +128,9 @@ export async function fetchMedia(
 ): Promise<{ data: ArrayBuffer; type: string; } | null> {
     if (!url || typeof url !== "string") return null;
 
+    const signal = typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(30_000)
+        : undefined;
     let current = url;
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
         const parsed = isAllowedMediaUrl(current);
@@ -137,9 +140,11 @@ export async function fetchMedia(
             headers: { Accept: "image/*,video/*,*/*;q=0.8" },
             redirect: "manual",
             credentials: "omit",
+            signal,
         });
 
         if (res.status >= 300 && res.status < 400) {
+            try { await res.body?.cancel(); } catch { }
             const loc = res.headers.get("location");
             if (!loc) return null;
             let next: URL;
@@ -153,44 +158,44 @@ export async function fetchMedia(
             continue;
         }
 
-        if (!res.ok) return null;
+        if (!res.ok) {
+            try { await res.body?.cancel(); } catch { }
+            return null;
+        }
 
         const cap = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_MAX_DOWNLOAD;
         const lenHeader = res.headers.get("content-length");
         if (lenHeader) {
             const len = Number(lenHeader);
-            if (Number.isFinite(len) && len > cap) return null;
+            if (Number.isFinite(len) && len > cap) {
+                try { await res.body?.cancel(); } catch { }
+                return null;
+            }
         }
 
         const body = res.body;
-        let data: ArrayBuffer;
-        if (body && typeof body.getReader === "function") {
-            const reader = body.getReader();
-            const chunks: Uint8Array[] = [];
-            let total = 0;
-            for (;;) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                if (!value) continue;
-                total += value.byteLength;
-                if (total > cap) {
-                    try { await reader.cancel(); } catch { }
-                    return null;
-                }
-                chunks.push(value);
+        if (!body || typeof body.getReader !== "function") return null;
+        const reader = body.getReader();
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+            total += value.byteLength;
+            if (total > cap) {
+                try { await reader.cancel(); } catch { }
+                return null;
             }
-            const out = new Uint8Array(total);
-            let off = 0;
-            for (const chunk of chunks) {
-                out.set(chunk, off);
-                off += chunk.byteLength;
-            }
-            data = out.buffer;
-        } else {
-            const buf = await res.arrayBuffer();
-            if (!buf.byteLength || buf.byteLength > cap) return null;
-            data = buf;
+            chunks.push(value);
         }
+        const out = new Uint8Array(total);
+        let off = 0;
+        for (const chunk of chunks) {
+            out.set(chunk, off);
+            off += chunk.byteLength;
+        }
+        const data = out.buffer;
 
         if (!data.byteLength || data.byteLength > cap) return null;
 

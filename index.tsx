@@ -669,11 +669,6 @@ function hostAllowed(hostname: string): boolean {
     return false;
 }
 
-function isTenorMediaHost(hostname: string): boolean {
-    const h = hostname.toLowerCase().replace(/\.$/, "");
-    return h === "media.tenor.com" || h === "c.tenor.com" || h.endsWith(".media.tenor.com");
-}
-
 function isDirectMediaUrl(url: string): boolean {
     try {
         const u = new URL(url);
@@ -691,44 +686,6 @@ function isDirectMediaUrl(url: string): boolean {
     } catch {
         return false;
     }
-}
-
-function tenorToKlipyFallbackUrls(url: string): string[] {
-    let parsed: URL;
-    try {
-        parsed = new URL(url);
-    } catch {
-        return [];
-    }
-    if (!isTenorMediaHost(parsed.hostname)) return [];
-    if (!isDirectMediaUrl(url)) return [];
-
-    const out: string[] = [];
-    const seen = new Set<string>();
-    for (const host of KLIPY_MEDIA_HOSTS) {
-        try {
-            const u = new URL(parsed.href);
-            u.hostname = host;
-            u.protocol = "https:";
-            if (seen.has(u.href)) continue;
-            seen.add(u.href);
-            out.push(u.href);
-        } catch {
-        }
-    }
-    return out;
-}
-
-function mediaDownloadCandidates(url: string): string[] {
-    if (!url) return [];
-    const out = [url];
-    const seen = new Set([url]);
-    for (const alt of tenorToKlipyFallbackUrls(url)) {
-        if (seen.has(alt)) continue;
-        seen.add(alt);
-        out.push(alt);
-    }
-    return out;
 }
 
 const lookupMemo = new Map<string, string[]>();
@@ -835,6 +792,10 @@ class FavoriteGifCache {
         this.smartEviction = enabled;
     }
 
+    isSmartEvictionEnabled() {
+        return this.smartEviction;
+    }
+
     isInitialized() {
         return this.initDone;
     }
@@ -876,7 +837,12 @@ class FavoriteGifCache {
         if (this.core.hasResidentData(key)) return true;
 
         const fromDisk = await this.backend.get(key);
-        if (!fromDisk || fromDisk.data.byteLength === 0) return false;
+        if (!fromDisk || fromDisk.data.byteLength === 0) {
+            this.core.delete(key);
+            this.revokeBlob(key);
+            try { await this.backend.delete(key); } catch { }
+            return false;
+        }
         this.core.loadEntry(fromDisk);
         this.core.ensureSoftMemory(key);
         return this.core.hasResidentData(key);
@@ -1370,8 +1336,20 @@ function getPluginNative(): Native | null {
 }
 
 const inflight = new Map<string, Promise<{ data: Uint8Array; mime: string; } | null>>();
+const failedAutoDownloads = new WeakMap<FavoriteGifCache, Map<string, string>>();
+const fullCacheStates = new WeakMap<FavoriteGifCache, string>();
 
 const MAX_ENTRY_BYTES = 12 * 1024 * 1024;
+
+function cacheState(cache: FavoriteGifCache) {
+    return `${cache.bytes()}:${cache.getMaxBytes()}:${cache.isSmartEvictionEnabled()}`;
+}
+
+function rememberAutoFailure(cache: FavoriteGifCache, key: string, state = "session") {
+    let failures = failedAutoDownloads.get(cache);
+    if (!failures) failedAutoDownloads.set(cache, failures = new Map());
+    failures.set(key, state);
+}
 
 function guessMime(url: string, contentType: string | null, data?: Uint8Array) {
 
@@ -1394,7 +1372,7 @@ function guessMime(url: string, contentType: string | null, data?: Uint8Array) {
 
 async function downloadOneUrl(
     url: string,
-    _fetchImpl: typeof fetch,
+    fetchImpl: typeof fetch,
     maxBytes: number,
 ): Promise<{ data: Uint8Array; mime: string; } | null> {
     if (!isDirectMediaUrl(url)) return null;
@@ -1420,22 +1398,52 @@ async function downloadOneUrl(
     }
 
     try {
-        const res = await _fetchImpl(url, {
+        const res = await fetchImpl(url, {
             credentials: "omit",
             cache: "no-store",
             mode: "cors",
             redirect: "error",
+            signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+                ? AbortSignal.timeout(30_000)
+                : undefined,
         } as RequestInit);
-        if (!res.ok) return null;
+        if (!res.ok) {
+            try { await res.body?.cancel(); } catch { }
+            return null;
+        }
         const lenHeader = res.headers.get("content-length");
         if (lenHeader) {
             const len = Number(lenHeader);
-            if (Number.isFinite(len) && len > maxBytes) return null;
+            if (Number.isFinite(len) && len > maxBytes) {
+                try { await res.body?.cancel(); } catch { }
+                return null;
+            }
         }
-        const buf = new Uint8Array(await res.arrayBuffer());
-        if (!buf.byteLength || buf.byteLength > maxBytes) return null;
-        const mime = guessMime(url, res.headers.get("content-type"), buf);
-        return { data: buf, mime };
+
+        const reader = res.body?.getReader();
+        if (!reader) return null;
+
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+            total += value.byteLength;
+            if (total > maxBytes) {
+                try { await reader.cancel(); } catch { }
+                return null;
+            }
+            chunks.push(value);
+        }
+        if (!total) return null;
+        const data = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+            data.set(chunk, offset);
+            offset += chunk.byteLength;
+        }
+        return { data, mime: guessMime(url, res.headers.get("content-type"), data) };
     } catch {
         return null;
     }
@@ -1445,13 +1453,8 @@ async function downloadFavoriteMedia(
     url: string,
     fetchImpl: typeof fetch = fetch,
     maxBytes = MAX_ENTRY_BYTES,
-): Promise<{ data: Uint8Array; mime: string; fromUrl?: string; } | null> {
-    const candidates = mediaDownloadCandidates(url);
-    for (const candidate of candidates) {
-        const hit = await downloadOneUrl(candidate, fetchImpl, maxBytes);
-        if (hit) return { ...hit, fromUrl: candidate };
-    }
-    return null;
+): Promise<{ data: Uint8Array; mime: string; } | null> {
+    return downloadOneUrl(url, fetchImpl, maxBytes);
 }
 
 async function getCachedBytes(cache: FavoriteGifCache, url: string) {
@@ -1494,7 +1497,9 @@ async function ensureCached(
         : fetchImplOrOpts;
     const fetchImpl = opts.fetchImpl ?? fetch;
     const allowEvict = opts.allowEvict === true;
-    const maxBytes = opts.maxBytes ?? MAX_ENTRY_BYTES;
+    const maxBytes = Number.isFinite(opts.maxBytes) && opts.maxBytes! > 0
+        ? opts.maxBytes!
+        : MAX_ENTRY_BYTES;
     const force = opts.force === true;
 
     if (!force && opts.isDenied?.(url)) return null;
@@ -1505,11 +1510,33 @@ async function ensureCached(
         return { ...hit, fromCache: true as const, stored: true as const };
     }
 
+    const state = cacheState(cache);
+    const canEvict = allowEvict && cache.isSmartEvictionEnabled();
+    const failedState = failedAutoDownloads.get(cache)?.get(key);
+    if (!force && (
+        failedState === "session"
+        || failedState === state
+        || fullCacheStates.get(cache) === state
+    )) {
+        return null;
+    }
+
+    const availableBytes = canEvict
+        ? cache.getMaxBytes()
+        : cache.getMaxBytes() - cache.bytes();
+    const downloadMaxBytes = Number.isFinite(availableBytes)
+        ? Math.min(maxBytes, availableBytes)
+        : maxBytes;
+    if (downloadMaxBytes <= 0) {
+        fullCacheStates.set(cache, state);
+        return null;
+    }
+
     let pending = inflight.get(key);
     if (!pending) {
         pending = (async () => {
             try {
-                return await downloadFavoriteMedia(url, fetchImpl, maxBytes);
+                return await downloadFavoriteMedia(url, fetchImpl, downloadMaxBytes);
             } catch {
                 return null;
             } finally {
@@ -1520,24 +1547,36 @@ async function ensureCached(
     }
 
     const downloaded = await pending;
-    if (!downloaded) return null;
-
-    if (downloaded.data.byteLength > maxBytes) {
+    if (!downloaded) {
+        if (!force) {
+            rememberAutoFailure(
+                cache,
+                key,
+                !canEvict && downloadMaxBytes < maxBytes ? cacheState(cache) : "session",
+            );
+            if (!canEvict && downloadMaxBytes < Math.min(maxBytes, MAX_ENTRY_BYTES)) {
+                fullCacheStates.set(cache, cacheState(cache));
+            }
+        }
         return null;
     }
 
-    await cache.put(key, downloaded.data, downloaded.mime, { allowEvict });
-
-    const fromKey = downloaded.fromUrl ? cacheKeyForUrl(downloaded.fromUrl) : null;
-    if (fromKey && fromKey !== key) {
-        await cache.put(fromKey, downloaded.data, downloaded.mime, { allowEvict: false });
+    if (downloaded.data.byteLength > maxBytes) {
+        if (!force) rememberAutoFailure(cache, key);
+        return null;
     }
 
-    let entry = cache.peekSync(key);
-    if (!entry && allowEvict) {
-        await cache.put(key, downloaded.data, downloaded.mime, { allowEvict: true });
-        entry = cache.peekSync(key);
+    const put = await cache.put(key, downloaded.data, downloaded.mime, { allowEvict });
+    if (!put.stored && !force) {
+        rememberAutoFailure(cache, key, put.skippedFull ? cacheState(cache) : "session");
     }
+    if (put.skippedFull) fullCacheStates.set(cache, cacheState(cache));
+    if (put.stored) {
+        failedAutoDownloads.get(cache)?.delete(key);
+        fullCacheStates.delete(cache);
+    }
+
+    const entry = cache.peekSync(key);
 
     return {
         data: downloaded.data,
@@ -1545,6 +1584,7 @@ async function ensureCached(
         key,
         fromCache: false as const,
         stored: !!entry,
+        skippedFull: put.skippedFull === true,
     };
 }
 
@@ -1935,6 +1975,7 @@ const pendingRemoveKeys = new Set<string>();
 let favoriteDiffFlush: Promise<void> | null = null;
 let favoritePoll: ReturnType<typeof setInterval> | null = null;
 let prefetchRunning = false;
+let prefetchDone = false;
 let wrapWork: Promise<void> | null = null;
 let wrapWorkPending: {
     favorites: any[];
@@ -2151,9 +2192,11 @@ async function cacheNewFavoriteRefs(refs: FavoriteGifRef[]) {
         const c = getCache();
         await c.init();
         for (const ref of refs) {
+            if (cache !== c) break;
             const tried = new Set<string>();
             const urls = [pickCacheableUrl(ref), ref.src, ref.url];
             for (const cacheUrl of urls) {
+                if (cache !== c) break;
                 if (!cacheUrl || !isLikelyGifMediaUrl(cacheUrl) || isAutoCacheDenied(cacheUrl)) continue;
                 const key = cacheKeyForUrl(cacheUrl);
                 if (tried.has(key)) continue;
@@ -2457,17 +2500,17 @@ async function runWrapWork(job: {
 
     let downloads = 0;
     for (const ref of job.refs) {
+        if (cache !== c) break;
         if (downloads >= 10) break;
-        for (const u of [pickCacheableUrl(ref), ref.src, ref.url]) {
-            if (!u || isAutoCacheDenied(u) || !isLikelyGifMediaUrl(u)) continue;
-            const key = cacheKeyForUrl(u);
-            if (!c.has(key) && !c.has(u) && downloads < 10) {
-                await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
-                downloads += 1;
-            }
-            if (c.has(key) || c.has(u)) {
-                await c.ensureBlobUrl(key, { bumpUsage: false });
-            }
+        const u = pickCacheableUrl(ref) || ref.src || ref.url;
+        if (!u || isAutoCacheDenied(u) || !isLikelyGifMediaUrl(u)) continue;
+        const key = cacheKeyForUrl(u);
+        if (!c.has(key) && !c.has(u)) {
+            await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
+            downloads += 1;
+        }
+        if (c.has(key) || c.has(u)) {
+            await c.ensureBlobUrl(key, { bumpUsage: false });
         }
     }
     for (const g of job.favorites) applyCacheSrc(g, c);
@@ -2524,6 +2567,7 @@ async function manualCacheGif(url: string) {
     }
 
     for (const u of queue) {
+        if (cache !== c) break;
         if (!u || tried.has(u)) continue;
         tried.add(u);
         try {
@@ -2582,7 +2626,7 @@ async function warmCachedFavoriteBlobs() {
 
 function kickPrefetch() {
     if (settings.store.prefetchOnStart === false) return;
-    if (prefetchRunning) return;
+    if (prefetchRunning || prefetchDone) return;
     void prefetchFavorites();
 }
 
@@ -2595,6 +2639,7 @@ async function prefetchFavorites() {
         requestFavoriteGifsLoad();
         const refs = getFavoriteGifRefsFromFrecency();
         if (!refs.length) return;
+        prefetchDone = true;
 
         refreshFavoriteSet(refs);
         const cap = c.getMaxBytes();
@@ -2606,20 +2651,18 @@ async function prefetchFavorites() {
         const seen = new Set<string>();
         let steps = 0;
         for (const ref of newest) {
-            if (c.bytes() >= cap) break;
-            for (const u of [pickCacheableUrl(ref), ref.src, ref.url]) {
-                if (!u || !isLikelyGifMediaUrl(u) || isAutoCacheDenied(u)) continue;
-                const key = cacheKeyForUrl(u);
-                if (seen.has(key) || c.has(key) || c.has(u)) continue;
-                seen.add(key);
-                try {
-                    await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
-                } catch {
-                }
-                if (c.bytes() >= cap) break;
-                steps += 1;
-                if (steps % 3 === 0) await new Promise(r => setTimeout(r, 0));
+            if (cache !== c || !prefetchRunning || settings.store.prefetchOnStart === false || c.bytes() >= cap) break;
+            const u = pickCacheableUrl(ref) || ref.src || ref.url;
+            if (!u || !isLikelyGifMediaUrl(u) || isAutoCacheDenied(u)) continue;
+            const key = cacheKeyForUrl(u);
+            if (seen.has(key) || c.has(key) || c.has(u)) continue;
+            seen.add(key);
+            try {
+                await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
+            } catch {
             }
+            steps += 1;
+            if (steps % 3 === 0) await new Promise(r => setTimeout(r, 0));
         }
 
         for (const ref of newest) {
@@ -2735,6 +2778,7 @@ export default definePlugin({
             void (async () => {
                 try {
                     await c.init();
+                    if (cache !== c) return;
                     await cacheOnUserAction(c, remote, fetch, autoCacheOpts());
                     c.ensureBlobUrlSync(cacheKeyForUrl(remote), { bumpUsage: true });
                 } catch {
@@ -2865,6 +2909,7 @@ export default definePlugin({
         lastFavorites = [];
         emptyRetryCount = 0;
         prefetchRunning = false;
+        prefetchDone = false;
     },
 });
 
