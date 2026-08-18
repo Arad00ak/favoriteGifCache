@@ -1370,6 +1370,8 @@ function getPluginNative(): Native | null {
 }
 
 const inflight = new Map<string, Promise<{ data: Uint8Array; mime: string; } | null>>();
+const failedAutoDownloads = new WeakMap<FavoriteGifCache, { state: string; keys: Set<string>; }>();
+const fullCacheStates = new WeakMap<FavoriteGifCache, string>();
 
 const MAX_ENTRY_BYTES = 12 * 1024 * 1024;
 
@@ -1505,11 +1507,29 @@ async function ensureCached(
         return { ...hit, fromCache: true as const, stored: true as const };
     }
 
+    const cacheState = `${cache.bytes()}:${cache.getMaxBytes()}`;
+    const failed = failedAutoDownloads.get(cache);
+    if (!allowEvict && (
+        (failed?.state === cacheState && failed.keys.has(key))
+        || fullCacheStates.get(cache) === cacheState
+    )) {
+        return null;
+    }
+
+    const remainingBytes = cache.getMaxBytes() - cache.bytes();
+    const downloadMaxBytes = !allowEvict && Number.isFinite(remainingBytes)
+        ? Math.min(maxBytes, remainingBytes)
+        : maxBytes;
+    if (downloadMaxBytes <= 0) {
+        fullCacheStates.set(cache, cacheState);
+        return null;
+    }
+
     let pending = inflight.get(key);
     if (!pending) {
         pending = (async () => {
             try {
-                return await downloadFavoriteMedia(url, fetchImpl, maxBytes);
+                return await downloadFavoriteMedia(url, fetchImpl, downloadMaxBytes);
             } catch {
                 return null;
             } finally {
@@ -1520,13 +1540,27 @@ async function ensureCached(
     }
 
     const downloaded = await pending;
-    if (!downloaded) return null;
+    if (!downloaded) {
+        if (!allowEvict) {
+            if (failed?.state === cacheState) failed.keys.add(key);
+            else failedAutoDownloads.set(cache, { state: cacheState, keys: new Set([key]) });
+            if (downloadMaxBytes < Math.min(maxBytes, MAX_ENTRY_BYTES)) {
+                fullCacheStates.set(cache, cacheState);
+            }
+        }
+        return null;
+    }
 
     if (downloaded.data.byteLength > maxBytes) {
         return null;
     }
 
-    await cache.put(key, downloaded.data, downloaded.mime, { allowEvict });
+    const put = await cache.put(key, downloaded.data, downloaded.mime, { allowEvict });
+    if (!allowEvict && put.skippedFull) fullCacheStates.set(cache, cacheState);
+    if (put.stored) {
+        failedAutoDownloads.delete(cache);
+        fullCacheStates.delete(cache);
+    }
 
     const fromKey = downloaded.fromUrl ? cacheKeyForUrl(downloaded.fromUrl) : null;
     if (fromKey && fromKey !== key) {
@@ -1545,6 +1579,7 @@ async function ensureCached(
         key,
         fromCache: false as const,
         stored: !!entry,
+        skippedFull: put.skippedFull === true,
     };
 }
 
@@ -1935,6 +1970,7 @@ const pendingRemoveKeys = new Set<string>();
 let favoriteDiffFlush: Promise<void> | null = null;
 let favoritePoll: ReturnType<typeof setInterval> | null = null;
 let prefetchRunning = false;
+let prefetchDone = false;
 let wrapWork: Promise<void> | null = null;
 let wrapWorkPending: {
     favorites: any[];
@@ -2582,7 +2618,7 @@ async function warmCachedFavoriteBlobs() {
 
 function kickPrefetch() {
     if (settings.store.prefetchOnStart === false) return;
-    if (prefetchRunning) return;
+    if (prefetchRunning || prefetchDone) return;
     void prefetchFavorites();
 }
 
@@ -2595,6 +2631,7 @@ async function prefetchFavorites() {
         requestFavoriteGifsLoad();
         const refs = getFavoriteGifRefsFromFrecency();
         if (!refs.length) return;
+        prefetchDone = true;
 
         refreshFavoriteSet(refs);
         const cap = c.getMaxBytes();
@@ -2606,8 +2643,9 @@ async function prefetchFavorites() {
         const seen = new Set<string>();
         let steps = 0;
         for (const ref of newest) {
-            if (c.bytes() >= cap) break;
+            if (!prefetchRunning || settings.store.prefetchOnStart === false || c.bytes() >= cap) break;
             for (const u of [pickCacheableUrl(ref), ref.src, ref.url]) {
+                if (!prefetchRunning || settings.store.prefetchOnStart === false) break;
                 if (!u || !isLikelyGifMediaUrl(u) || isAutoCacheDenied(u)) continue;
                 const key = cacheKeyForUrl(u);
                 if (seen.has(key) || c.has(key) || c.has(u)) continue;
@@ -2865,6 +2903,7 @@ export default definePlugin({
         lastFavorites = [];
         emptyRetryCount = 0;
         prefetchRunning = false;
+        prefetchDone = false;
     },
 });
 
