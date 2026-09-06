@@ -7,11 +7,11 @@
  */
 
 import * as DataStore from "@api/DataStore";
-import { definePluginSettings } from "@api/Settings";
+import { definePluginSettings, Settings } from "@api/Settings";
 import { Button } from "@components/Button";
 import definePlugin, { OptionType } from "@utils/types";
 import type { PluginNative } from "@utils/types";
-import { Menu, Toasts, useEffect, useState } from "@webpack/common";
+import { FluxDispatcher, Menu, Toasts, UserSettingsActionCreators, useEffect, useState } from "@webpack/common";
 
 const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;
 
@@ -70,9 +70,9 @@ class GifCacheCore {
         return this.maxBytes;
     }
 
-    setMaxBytes(n: number) {
+    setMaxBytes(n: number, enforce = true) {
         this.maxBytes = n > 0 ? n : Number.POSITIVE_INFINITY;
-        return this.enforceCap();
+        return enforce ? this.enforceCap() : [];
     }
 
     setProtectedKeys(keys: Iterable<string>) {
@@ -150,13 +150,17 @@ class GifCacheCore {
     }
 
     
-    put(
+    preparePut(
         key: string,
         data: Uint8Array,
         mimeType = "application/octet-stream",
         options: PutOptions = {},
-    ): PutResult {
-        if (!key) return { stored: false, evictedKeys: [] };
+    ): { result: PutResult; entry: CacheEntry | null; } {
+        const rejected = (skippedFull = false) => ({
+            result: { stored: false, evictedKeys: [], skippedFull },
+            entry: null,
+        });
+        if (!key) return rejected();
 
         const allowEvict = options.allowEvict === true;
         const payload = data instanceof Uint8Array ? data.slice() : new Uint8Array(data);
@@ -164,37 +168,22 @@ class GifCacheCore {
         const evictedKeys: string[] = [];
 
         const existing = this.entries.get(key);
-        if (existing) {
-            this.totalBytes -= existing.size;
-            this.entries.delete(key);
-        }
-
         if (size > this.maxBytes && this.maxBytes !== Number.POSITIVE_INFINITY) {
-            return { stored: false, evictedKeys };
+            return rejected();
         }
-
-        while (this.totalBytes + size > this.maxBytes) {
-            if (!allowEvict) {
-
-                if (existing) {
-                    this.entries.set(existing.key, existing);
-                    this.totalBytes += existing.size;
-                }
-                return { stored: false, evictedKeys, skippedFull: true };
+        let required = this.totalBytes - (existing?.size ?? 0) + size - this.maxBytes;
+        if (required > 0) {
+            if (!allowEvict) return rejected(true);
+            const victims = [...this.entries.values()].filter(e => e.key !== key).sort((a, b) => {
+                const protection = Number(this.protectedKeys.has(a.key)) - Number(this.protectedKeys.has(b.key));
+                return protection || (this.isWorse(a, b) ? -1 : this.isWorse(b, a) ? 1 : 0);
+            });
+            for (const victim of victims) {
+                if (required <= 0) break;
+                required -= victim.size;
+                evictedKeys.push(victim.key);
             }
-            const victim = this.pickVictim(key);
-            if (!victim) break;
-            this.entries.delete(victim.key);
-            this.totalBytes -= victim.size;
-            evictedKeys.push(victim.key);
-        }
-
-        if (this.totalBytes + size > this.maxBytes) {
-            if (existing) {
-                this.entries.set(existing.key, existing);
-                this.totalBytes += existing.size;
-            }
-            return { stored: false, evictedKeys, skippedFull: true };
+            if (required > 0) return rejected(true);
         }
 
         const t = this.now();
@@ -208,10 +197,17 @@ class GifCacheCore {
             createdAt: existing?.createdAt ?? t,
         };
 
-        this.entries.set(key, entry);
-        this.totalBytes += size;
-        this.ensureSoftMemory(key);
-        return { stored: true, evictedKeys };
+        return { result: { stored: true, evictedKeys }, entry };
+    }
+
+    put(key: string, data: Uint8Array, mimeType = "application/octet-stream", options: PutOptions = {}): PutResult {
+        const { result, entry } = this.preparePut(key, data, mimeType, options);
+        if (entry) {
+            for (const victim of result.evictedKeys) this.delete(victim);
+            this.loadEntry(entry);
+            this.ensureSoftMemory(key);
+        }
+        return result;
     }
 
     delete(key: string) {
@@ -475,7 +471,8 @@ class IndexedDBStorageBackend implements StorageBackend {
         return new Promise<void>((resolve, reject) => {
             const req = this.store("readwrite").put(record);
             req.onerror = () => reject(req.error);
-            req.onsuccess = () => resolve();
+            req.transaction!.oncomplete = () => resolve();
+            req.transaction!.onabort = () => reject(req.transaction!.error ?? new Error("Cache write aborted"));
         });
     }
 
@@ -484,7 +481,8 @@ class IndexedDBStorageBackend implements StorageBackend {
         return new Promise<void>((resolve, reject) => {
             const req = this.store("readwrite").delete(key);
             req.onerror = () => reject(req.error);
-            req.onsuccess = () => resolve();
+            req.transaction!.oncomplete = () => resolve();
+            req.transaction!.onabort = () => reject(req.transaction!.error ?? new Error("Cache deletion aborted"));
         });
     }
 
@@ -493,7 +491,8 @@ class IndexedDBStorageBackend implements StorageBackend {
         return new Promise<void>((resolve, reject) => {
             const req = this.store("readwrite").clear();
             req.onerror = () => reject(req.error);
-            req.onsuccess = () => resolve();
+            req.transaction!.oncomplete = () => resolve();
+            req.transaction!.onabort = () => reject(req.transaction!.error ?? new Error("Cache clear aborted"));
         });
     }
 
@@ -506,6 +505,7 @@ class IndexedDBStorageBackend implements StorageBackend {
             for (const k of keys) store.delete(k);
             tx.oncomplete = () => resolve();
             tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error ?? new Error("Cache deletion aborted"));
         });
     }
 }
@@ -781,6 +781,9 @@ class FavoriteGifCache {
     private liveBlobs = new Set<string>();
     private metaPersistQueue = new Map<string, ReturnType<typeof setTimeout>>();
     private revokeListener: ((blobUrl: string) => void) | null = null;
+    private pending: Promise<void> = Promise.resolve();
+    private disposed = false;
+    private closing: Promise<void> | null = null;
 
     constructor(options: FavoriteGifCacheOptions = {}) {
         this.core = new GifCacheCore(options);
@@ -805,47 +808,81 @@ class FavoriteGifCache {
     }
 
     async init() {
+        if (this.disposed) throw new Error("Cache is closed");
         if (!this.ready) {
             this.ready = (async () => {
                 await this.backend.open();
                 const all = await this.backend.getAll();
-
+                if (this.disposed) throw new Error("Cache is closed");
                 for (const entry of all) this.core.loadEntry(entry);
-
-                const before = new Set(this.core.keys());
-                const removed = this.core.setMaxBytes(this.core.getMaxBytes());
-                const gone = removed.length
-                    ? removed
-                    : [...before].filter(k => !this.core.has(k));
-                if (gone.length) {
-                    await this.backend.deleteMany(gone);
-                    for (const k of gone) this.revokeBlob(k);
-                }
-
-                this.core.ensureSoftMemory();
-
+                await this.trimToLimit();
+                this.trimMemory();
                 this.initDone = true;
-            })();
+            })().catch(error => {
+                this.ready = null;
+                throw error;
+            });
         }
         await this.ready;
     }
 
-    
-    async hydrate(key: string): Promise<boolean> {
-        await this.init();
-        if (!this.core.has(key)) return false;
-        if (this.core.hasResidentData(key)) return true;
+    private run<T>(work: () => Promise<T>): Promise<T> {
+        const job = this.pending.then(async () => {
+            await this.init();
+            if (this.disposed) throw new Error("Cache is closed");
+            return work();
+        });
+        this.pending = job.then(() => {}, () => {});
+        return job;
+    }
 
-        const fromDisk = await this.backend.get(key);
-        if (!fromDisk || fromDisk.data.byteLength === 0) {
-            this.core.delete(key);
-            this.revokeBlob(key);
-            try { await this.backend.delete(key); } catch { }
-            return false;
+    private async trimToLimit() {
+        while (this.core.bytes() > this.core.getMaxBytes()) {
+            const victim = this.core.pickVictim();
+            if (!victim) break;
+            await this.backend.delete(victim.key);
+            this.core.delete(victim.key);
+            this.revokeBlob(victim.key);
         }
-        this.core.loadEntry(fromDisk);
-        this.core.ensureSoftMemory(key);
-        return this.core.hasResidentData(key);
+    }
+
+    private trimMemory(keepKey?: string) {
+        for (const key of this.core.ensureSoftMemory(keepKey)) this.revokeBlob(key);
+    }
+
+    dispose(): Promise<void> {
+        if (this.closing) return this.closing;
+        this.disposed = true;
+        this.initDone = false;
+        for (const timer of this.metaPersistQueue.values()) clearTimeout(timer);
+        this.metaPersistQueue.clear();
+        for (const key of [...this.blobUrls.keys()]) this.revokeBlob(key);
+        this.closing = (async () => {
+            await this.pending;
+            await this.ready?.catch(() => {});
+            this.core.clear();
+            this.initDone = false;
+            await this.backend.close();
+        })();
+        return this.closing;
+    }
+
+    async hydrate(key: string): Promise<boolean> {
+        return this.run(async () => {
+            if (!this.core.has(key)) return false;
+            if (this.core.hasResidentData(key)) return true;
+            const fromDisk = await this.backend.get(key);
+            if (!fromDisk || fromDisk.data.byteLength === 0) {
+                await this.backend.delete(key);
+                this.core.delete(key);
+                this.revokeBlob(key);
+                return false;
+            }
+            if (this.disposed) return false;
+            this.core.loadEntry(fromDisk);
+            this.trimMemory(key);
+            return this.core.hasResidentData(key);
+        });
     }
 
     getMaxBytes() {
@@ -853,14 +890,10 @@ class FavoriteGifCache {
     }
 
     async setMaxBytes(n: number) {
-        await this.init();
-        const before = new Set(this.core.keys());
-        this.core.setMaxBytes(n);
-        const removed = [...before].filter(k => !this.core.has(k));
-        if (removed.length) {
-            await this.backend.deleteMany(removed);
-            for (const k of removed) this.revokeBlob(k);
-        }
+        return this.run(async () => {
+            this.core.setMaxBytes(n, false);
+            await this.trimToLimit();
+        });
     }
 
     
@@ -871,6 +904,7 @@ class FavoriteGifCache {
     
     setDisplayPinnedKeys(keys: Iterable<string>) {
         this.core.setDisplayPinnedKeys(keys);
+        this.trimMemory();
     }
 
     size() {
@@ -898,6 +932,7 @@ class FavoriteGifCache {
     }
 
     touchSync(key: string) {
+        if (this.disposed) return false;
         if (!this.core.touch(key)) return false;
         const entry = this.core.peekRef(key);
         if (entry) this.scheduleMetaPersist(entry);
@@ -911,45 +946,60 @@ class FavoriteGifCache {
         mimeType = "application/octet-stream",
         options: PutOptions = {},
     ): Promise<PutResult> {
-        await this.init();
-        const allowEvict = this.smartEviction && options.allowEvict === true;
-        const result = this.core.put(key, data, mimeType, { allowEvict });
-
-        if (result.evictedKeys.length) {
-            await this.backend.deleteMany(result.evictedKeys);
-            for (const k of result.evictedKeys) this.revokeBlob(k);
-        }
-
-        if (result.stored) {
-            const stored = this.core.peekRef(key);
-            if (stored && stored.data.byteLength > 0) {
-                await this.backend.put(stored);
-                if (!this.blobUrls.has(key)) this.ensureBlobUrlSync(key, { bumpUsage: false });
+        return this.run(async () => {
+            const allowEvict = this.smartEviction && options.allowEvict === true;
+            const { result, entry } = this.core.preparePut(key, data, mimeType, { allowEvict });
+            if (!entry) return result;
+            for (const victim of result.evictedKeys) {
+                await this.backend.delete(victim);
+                this.core.delete(victim);
+                this.revokeBlob(victim);
             }
-        }
-
-        return result;
+            await this.backend.put(entry);
+            const latest = this.core.getMeta(key);
+            if (latest) {
+                entry.useCount = latest.useCount;
+                entry.lastUsed = Math.max(entry.lastUsed, latest.lastUsed);
+            }
+            this.revokeBlob(key);
+            this.core.loadEntry(entry);
+            if (!this.disposed) {
+                this.trimMemory(key);
+                this.ensureBlobUrlSync(key, { bumpUsage: false });
+            }
+            return result;
+        });
     }
 
     async delete(key: string) {
-        await this.init();
-        const ok = this.core.delete(key);
-        if (ok) {
+        return this.run(async () => {
+            if (!this.core.has(key)) return false;
             await this.backend.delete(key);
+            this.core.delete(key);
             this.revokeBlob(key);
-        }
-        return ok;
+            return true;
+        });
     }
 
     async clear() {
-        await this.init();
-        for (const k of [...this.blobUrls.keys()]) this.revokeBlob(k);
-        this.core.clear();
-        await this.backend.clear();
+        return this.run(async () => {
+            try {
+                await this.backend.clear();
+            } catch (error) {
+                const remaining = await this.backend.getAll();
+                for (const k of [...this.blobUrls.keys()]) this.revokeBlob(k);
+                this.core.clear();
+                for (const entry of remaining) this.core.loadEntry(entry);
+                this.trimMemory();
+                throw error;
+            }
+            for (const k of [...this.blobUrls.keys()]) this.revokeBlob(k);
+            this.core.clear();
+        });
     }
 
     ensureBlobUrlSync(key: string, opts: BlobUrlOptions = {}): string | null {
-        if (!key) return null;
+        if (!key || this.disposed) return null;
         if (typeof Blob === "undefined" || typeof URL === "undefined" || !URL.createObjectURL) {
             return null;
         }
@@ -1032,9 +1082,11 @@ class FavoriteGifCache {
 
         const t = setTimeout(() => {
             this.metaPersistQueue.delete(entry.key);
-            const latest = this.core.peekRef(entry.key);
-            if (!latest || (latest.data.byteLength === 0 && latest.size > 0)) return;
-            void this.backend.put(latest).catch(() => {});
+            void this.run(async () => {
+                const latest = this.core.peekRef(entry.key);
+                if (!latest || (latest.data.byteLength === 0 && latest.size > 0)) return;
+                await this.backend.put({ ...latest, data: latest.data.slice() });
+            }).catch(() => {});
         }, 50);
         this.metaPersistQueue.set(entry.key, t);
     }
@@ -1072,6 +1124,11 @@ interface FavoriteGifRef {
     order?: number;
 }
 
+interface FavoriteGifRefsState {
+    loaded: boolean;
+    refs: FavoriteGifRef[];
+}
+
 function getFrecencySettings(): any | null {
     try {
         const ac = UserSettingsActionCreators?.FrecencyUserSettingsActionCreators;
@@ -1100,13 +1157,17 @@ function requestFavoriteGifsLoad() {
 }
 
 function getFavoriteGifRefsFromFrecency(): FavoriteGifRef[] {
+    return getFavoriteGifRefsState().refs;
+}
+
+function getFavoriteGifRefsState(): FavoriteGifRefsState {
     try {
         const FrecencyUserSettings = getFrecencySettings();
-        if (!FrecencyUserSettings?.getCurrentValue) return [];
+        if (!FrecencyUserSettings?.getCurrentValue) return { loaded: false, refs: [] };
 
         const value = FrecencyUserSettings.getCurrentValue();
         const gifs = value?.favoriteGifs?.gifs;
-        if (!gifs || typeof gifs !== "object") return [];
+        if (!gifs || typeof gifs !== "object") return { loaded: false, refs: [] };
 
         const out: FavoriteGifRef[] = [];
         for (const [key, meta] of Object.entries(gifs as Record<string, any>)) {
@@ -1122,9 +1183,9 @@ function getFavoriteGifRefsFromFrecency(): FavoriteGifRef[] {
                 order: meta?.order,
             });
         }
-        return sortFavoritesNewestFirst(out);
+        return { loaded: true, refs: sortFavoritesNewestFirst(out) };
     } catch {
-        return [];
+        return { loaded: false, refs: [] };
     }
 }
 
@@ -1515,8 +1576,8 @@ async function ensureCached(
     const failedState = failedAutoDownloads.get(cache)?.get(key);
     if (!force && (
         failedState === "session"
-        || failedState === state
-        || fullCacheStates.get(cache) === state
+        || (!canEvict && failedState === state)
+        || (!canEvict && fullCacheStates.get(cache) === state)
     )) {
         return null;
     }
@@ -1639,7 +1700,7 @@ const settingsHooks = {
     onCacheDirectoryChange: () => {},
 };
 
-const STALE_SETTING_KEYS = ["maxEntries", "showCacheBadges"] as const;
+const STALE_SETTING_KEYS = ["maxEntries", "showCacheBadges", "rewriteFavoriteSrc"] as const;
 
 function purgeStalePluginSettings() {
     try {
@@ -1689,11 +1750,6 @@ const settings = definePluginSettings({
     prefetchOnStart: {
         type: OptionType.BOOLEAN,
         description: "Download favorites in the background until the cache is full",
-        default: true,
-    },
-    rewriteFavoriteSrc: {
-        type: OptionType.BOOLEAN,
-        description: "Show cached GIFs from disk in the picker (faster)",
         default: true,
     },
 });
@@ -1974,6 +2030,12 @@ const pendingAddRefs = new Map<string, FavoriteGifRef>();
 const pendingRemoveKeys = new Set<string>();
 let favoriteDiffFlush: Promise<void> | null = null;
 let favoritePoll: ReturnType<typeof setInterval> | null = null;
+let favoriteUpdateHook: {
+    actionCreators: any;
+    original: (...args: any[]) => any;
+    wrapped: (...args: any[]) => any;
+    timer: ReturnType<typeof setTimeout> | null;
+} | null = null;
 let prefetchRunning = false;
 let prefetchDone = false;
 let wrapWork: Promise<void> | null = null;
@@ -2013,8 +2075,10 @@ function getCache() {
 }
 
 async function rebuildCache() {
+    const previous = cache;
     cache = null;
     setActiveCache(null);
+    if (previous) await previous.dispose();
     const c = getCache();
     await c.init();
     c.setSmartEviction(settings.store.smartEviction !== false);
@@ -2046,8 +2110,7 @@ settingsHooks.onSmartEvictionChange = () => {
 };
 settingsHooks.onCacheDirectoryChange = () => { void rebuildCache(); };
 
-function refreshFavoriteSet(refs?: FavoriteGifRef[]): { added: string[]; removed: string[]; } {
-    const list = refs ?? getFavoriteGifRefsFromFrecency();
+function refreshFavoriteSet(list: FavoriteGifRef[]): { added: string[]; removed: string[]; } {
     const next = new Set<string>();
     const primaryByKey = new Map<string, string>();
 
@@ -2094,8 +2157,9 @@ function enqueueFavoriteDiff(added: string[], removed: string[], refs: FavoriteG
 
 function syncFromFrecency() {
     hookFavoriteUpdates();
-    const refs = getFavoriteGifRefsFromFrecency();
-    if (!refs.length) return;
+    const state = getFavoriteGifRefsState();
+    if (!state.loaded) return;
+    const refs = state.refs;
     const { added, removed } = refreshFavoriteSet(refs);
     enqueueFavoriteDiff(added, removed, refs);
     kickPrefetch();
@@ -2104,22 +2168,45 @@ function syncFromFrecency() {
 function hookFavoriteUpdates() {
     try {
         const ac = UserSettingsActionCreators?.FrecencyUserSettingsActionCreators;
-        if (!ac || (ac as any).__fgcHooked) return;
+        if (!ac) return;
+        if (favoriteUpdateHook) {
+            if (favoriteUpdateHook.actionCreators === ac && ac.updateAsync === favoriteUpdateHook.wrapped) return;
+            unhookFavoriteUpdates();
+        }
         const orig = ac.updateAsync;
         if (typeof orig !== "function") return;
-        (ac as any).__fgcHooked = true;
-        let hookTimer: ReturnType<typeof setTimeout> | null = null;
-        ac.updateAsync = function (this: any, key: string, ...rest: any[]) {
+        const hook = {
+            actionCreators: ac,
+            original: orig,
+            wrapped: null as any,
+            timer: null as ReturnType<typeof setTimeout> | null,
+        };
+        hook.wrapped = function (this: any, key: string, ...rest: any[]) {
             const ret = orig.call(this, key, ...rest);
             if (key === "favoriteGifs") {
-                if (hookTimer) clearTimeout(hookTimer);
-                hookTimer = setTimeout(() => {
-                    hookTimer = null;
+                if (hook.timer) clearTimeout(hook.timer);
+                hook.timer = setTimeout(() => {
+                    hook.timer = null;
                     try { syncFromFrecency(); } catch { }
                 }, 50);
             }
             return ret;
         };
+        ac.updateAsync = hook.wrapped;
+        favoriteUpdateHook = hook;
+    } catch {
+    }
+}
+
+function unhookFavoriteUpdates() {
+    const hook = favoriteUpdateHook;
+    favoriteUpdateHook = null;
+    if (!hook) return;
+    if (hook.timer) clearTimeout(hook.timer);
+    try {
+        if (hook.actionCreators.updateAsync === hook.wrapped) {
+            hook.actionCreators.updateAsync = hook.original;
+        }
     } catch {
     }
 }
@@ -2296,7 +2383,7 @@ function remoteCandidates(gif: any): string[] {
 
 function applyCacheSrc(gif: any, c: FavoriteGifCache | null): boolean {
     healStoreGif(gif, c);
-    if (!c?.isInitialized() || !settings.store.rewriteFavoriteSrc) return false;
+    if (!c?.isInitialized()) return false;
     if (isBlobOrDataUrl(gif.src) && c.isLiveBlobUrl(gif.src)) return false;
 
     let format = typeof gif.format === "number"
@@ -2384,7 +2471,6 @@ function onPickerMediaError(ev: Event) {
 
 function maybeSwapMedia(el: HTMLImageElement | HTMLVideoElement) {
     try {
-        if (!settings.store.rewriteFavoriteSrc) return;
         const src = el.getAttribute("src") || el.src || "";
         if (!src || src.startsWith("blob:") || src.startsWith("data:")) return;
         if (!isRemoteHttpUrl(src) || !isLikelyGifMediaUrl(src)) return;
@@ -2603,21 +2689,12 @@ async function warmCachedFavoriteBlobs() {
     try {
         const c = getCache();
         await c.init();
-        let refs = getFavoriteGifRefsFromFrecency();
-        if (!refs.length) {
+        let state = getFavoriteGifRefsState();
+        if (!state.loaded) {
             requestFavoriteGifsLoad();
-            refs = getFavoriteGifRefsFromFrecency();
+            state = getFavoriteGifRefsState();
         }
-        if (refs.length) refreshFavoriteSet(refs);
-        const keys = pinKeysForRefs(refs);
-        c.setDisplayPinnedKeys(keys);
-        for (const key of keys) {
-            if (!c.has(key)) continue;
-            try {
-                await c.ensureBlobUrl(key, { bumpUsage: false });
-            } catch {
-            }
-        }
+        if (state.loaded) refreshFavoriteSet(state.refs);
         for (const g of lastFavorites) applyCacheSrc(g, c);
         scanPickerMedia();
     } catch {
@@ -2799,7 +2876,12 @@ export default definePlugin({
 
             if (favorites.length === 0) {
                 requestFavoriteGifsLoad();
-                refreshFavoriteSet();
+                const state = getFavoriteGifRefsState();
+                if (state.loaded) {
+                    const { added, removed } = refreshFavoriteSet(state.refs);
+                    enqueueFavoriteDiff(added, removed, state.refs);
+                    getCache().setDisplayPinnedKeys([]);
+                }
                 scheduleEmptyRetry(instance);
                 return favorites;
             }
@@ -2811,8 +2893,8 @@ export default definePlugin({
             for (const g of favorites) applyCacheSrc(g, ready);
 
             const refs = refsFromFavorites(favorites);
-            const { added } = refreshFavoriteSet(refs);
-            enqueueFavoriteDiff(added, [], refs);
+            const { added, removed } = refreshFavoriteSet(refs);
+            enqueueFavoriteDiff(added, removed, refs);
             const visibleKeys = pinKeysForRefs(refs);
             c.setDisplayPinnedKeys(visibleKeys);
             queueWrapWork(favorites, refs, visibleKeys);
@@ -2827,14 +2909,6 @@ export default definePlugin({
     async start() {
         try {
             purgeStalePluginSettings();
-
-            try {
-                if (settings.store.rewriteFavoriteSrc !== true) {
-                    settings.store.rewriteFavoriteSrc = true;
-                }
-            } catch {
-
-            }
             await loadDenylist();
             await applyLimitsFromSettings();
 
@@ -2844,7 +2918,8 @@ export default definePlugin({
             }
 
             requestFavoriteGifsLoad();
-            refreshFavoriteSet();
+            const state = getFavoriteGifRefsState();
+            if (state.loaded) refreshFavoriteSet(state.refs);
             hookFavoriteUpdates();
             bindMediaErrorHealer();
             ensureMediaObserver();
@@ -2897,12 +2972,15 @@ export default definePlugin({
             clearInterval(favoritePoll);
             favoritePoll = null;
         }
+        unhookFavoriteUpdates();
         pendingAddRefs.clear();
         pendingRemoveKeys.clear();
         unbindMediaErrorHealer();
         wrapWorkPending = null;
+        const previous = cache;
         cache = null;
         setActiveCache(null);
+        if (previous) void previous.dispose().catch(() => { });
         favoriteUrlSet = new Set();
         favoritesSeeded = false;
         lastPickerInstance = null;

@@ -5,11 +5,13 @@
  */
 
 import { app, dialog } from "electron";
+import { createHash } from "crypto";
 import {
     existsSync,
     mkdirSync,
     readFileSync,
     readdirSync,
+    renameSync,
     unlinkSync,
     writeFileSync,
 } from "fs";
@@ -66,12 +68,22 @@ function metaPath(dir: string) {
     return join(dir, "meta.json");
 }
 
-function fileNameForKey(key: string) {
+function legacyFileNameForKey(key: string) {
     return Buffer.from(key, "utf8").toString("base64url");
+}
+
+function fileNameForKey(key: string) {
+    return createHash("sha256").update(key, "utf8").digest("hex");
 }
 
 function isSafeBlobFileName(name: string) {
     return typeof name === "string" && /^[A-Za-z0-9_-]+$/.test(name);
+}
+
+function metadataFileName(key: string, info: { file?: string; }) {
+    return info.file && isSafeBlobFileName(info.file)
+        ? info.file
+        : legacyFileNameForKey(key);
 }
 
 function resolveBlobPath(dir: string, file: string): string | null {
@@ -114,7 +126,15 @@ function readMeta(dir: string): Record<string, Omit<NativeCacheRecord, "data" | 
 }
 
 function writeMeta(dir: string, meta: Record<string, unknown>) {
-    writeFileSync(metaPath(dir), JSON.stringify(meta), "utf8");
+    const target = metaPath(dir);
+    const temporary = target + ".tmp";
+    try {
+        writeFileSync(temporary, JSON.stringify(meta), "utf8");
+        renameSync(temporary, target);
+    } catch (error) {
+        try { unlinkSync(temporary); } catch { }
+        throw error;
+    }
 }
 
 export function getDefaultCacheDir() {
@@ -230,7 +250,7 @@ function readOneEntry(
     info: { file?: string; mimeType?: string; useCount?: number; lastUsed?: number; createdAt?: number; size?: number; },
 ): NativeCacheRecord | null {
     try {
-        const name = isSafeBlobFileName(info.file || "") ? info.file! : fileNameForKey(key);
+        const name = metadataFileName(key, info);
         const file = resolveBlobPath(dir, name);
         if (!file || !existsSync(file)) return null;
         const buf = readFileSync(file);
@@ -274,10 +294,28 @@ export async function putEntry(_e: unknown, dir: string, entry: NativeCacheRecor
     const full = resolveBlobPath(dir, file);
     if (!full) throw new Error("Invalid cache key");
     const bytes = Buffer.from(entry.data);
+    const meta = readMeta(dir);
+    const previous = meta[entry.key];
+    const previousName = previous ? metadataFileName(entry.key, previous) : null;
+    const previousFull = previousName
+        ? resolveBlobPath(dir, previousName)
+        : null;
+    const previousBytes = previousFull && existsSync(previousFull)
+        ? readFileSync(previousFull)
+        : null;
+
     writeFileSync(full, bytes);
 
-    const meta = readMeta(dir);
-    meta[entry.key] = {
+    if (previousFull && previousFull !== full && previousBytes) {
+        try {
+            unlinkSync(previousFull);
+        } catch (error) {
+            try { unlinkSync(full); } catch { }
+            throw error;
+        }
+    }
+
+    const next = {
         file,
         mimeType: entry.mimeType || "application/octet-stream",
         useCount: entry.useCount || 0,
@@ -285,20 +323,26 @@ export async function putEntry(_e: unknown, dir: string, entry: NativeCacheRecor
         createdAt: entry.createdAt || Date.now(),
         size: entry.size || bytes.byteLength,
     };
-    writeMeta(dir, meta);
+    meta[entry.key] = next;
+    try {
+        writeMeta(dir, meta);
+    } catch (error) {
+        if (previousFull && previousBytes) writeFileSync(previousFull, previousBytes);
+        if (previousFull !== full) {
+            try { unlinkSync(full); } catch { }
+        }
+        throw error;
+    }
 }
 
 export async function deleteEntry(_e: unknown, dir: string, key: string) {
     await ensureCacheDir(_e, dir);
     const meta = readMeta(dir);
     const info = meta[key];
-    const name = info?.file && isSafeBlobFileName(info.file) ? info.file : fileNameForKey(key);
+    const name = metadataFileName(key, info || {});
     const full = resolveBlobPath(dir, name);
     if (full && existsSync(full)) {
-        try {
-            unlinkSync(full);
-        } catch {
-        }
+        unlinkSync(full);
     }
     delete meta[key];
     writeMeta(dir, meta);
@@ -313,6 +357,8 @@ export async function deleteEntries(_e: unknown, dir: string, keys: string[]) {
 export async function clearCacheDir(_e: unknown, dir: string) {
     await ensureCacheDir(_e, dir);
     const bdir = blobsDir(dir);
+    const failures: unknown[] = [];
+    const failedNames = new Set<string>();
     if (existsSync(bdir)) {
         for (const name of readdirSync(bdir)) {
             if (!isSafeBlobFileName(name)) continue;
@@ -320,9 +366,17 @@ export async function clearCacheDir(_e: unknown, dir: string) {
             if (!full) continue;
             try {
                 unlinkSync(full);
-            } catch {
+            } catch (error) {
+                failedNames.add(name);
+                failures.push(error);
             }
         }
     }
-    writeMeta(dir, {});
+    const meta = readMeta(dir);
+    const remaining: typeof meta = {};
+    for (const [key, info] of Object.entries(meta)) {
+        if (failedNames.has(metadataFileName(key, info))) remaining[key] = info;
+    }
+    writeMeta(dir, remaining);
+    if (failures.length) throw failures[0];
 }
