@@ -5,6 +5,7 @@
  */
 
 import { app, dialog } from "electron";
+import { createHash } from "crypto";
 import {
     existsSync,
     mkdirSync,
@@ -66,12 +67,22 @@ function metaPath(dir: string) {
     return join(dir, "meta.json");
 }
 
-function fileNameForKey(key: string) {
+function legacyFileNameForKey(key: string) {
     return Buffer.from(key, "utf8").toString("base64url");
+}
+
+function fileNameForKey(key: string) {
+    return createHash("sha256").update(key, "utf8").digest("hex");
 }
 
 function isSafeBlobFileName(name: string) {
     return typeof name === "string" && /^[A-Za-z0-9_-]+$/.test(name);
+}
+
+function metadataFileName(key: string, info: { file?: string; }) {
+    return info.file && isSafeBlobFileName(info.file)
+        ? info.file
+        : legacyFileNameForKey(key);
 }
 
 function resolveBlobPath(dir: string, file: string): string | null {
@@ -230,7 +241,7 @@ function readOneEntry(
     info: { file?: string; mimeType?: string; useCount?: number; lastUsed?: number; createdAt?: number; size?: number; },
 ): NativeCacheRecord | null {
     try {
-        const name = isSafeBlobFileName(info.file || "") ? info.file! : fileNameForKey(key);
+        const name = metadataFileName(key, info);
         const file = resolveBlobPath(dir, name);
         if (!file || !existsSync(file)) return null;
         const buf = readFileSync(file);
@@ -274,10 +285,27 @@ export async function putEntry(_e: unknown, dir: string, entry: NativeCacheRecor
     const full = resolveBlobPath(dir, file);
     if (!full) throw new Error("Invalid cache key");
     const bytes = Buffer.from(entry.data);
-    writeFileSync(full, bytes);
 
     const meta = readMeta(dir);
-    meta[entry.key] = {
+    const previous = meta[entry.key];
+    const previousName = previous ? metadataFileName(entry.key, previous) : null;
+    const previousFull = previousName ? resolveBlobPath(dir, previousName) : null;
+    const previousBytes = previousFull && existsSync(previousFull)
+        ? readFileSync(previousFull)
+        : null;
+
+    writeFileSync(full, bytes);
+
+    if (previousFull && previousFull !== full && previousBytes) {
+        try {
+            unlinkSync(previousFull);
+        } catch (error) {
+            try { unlinkSync(full); } catch { }
+            throw error;
+        }
+    }
+
+    const next = {
         file,
         mimeType: entry.mimeType || "application/octet-stream",
         useCount: entry.useCount || 0,
@@ -285,20 +313,26 @@ export async function putEntry(_e: unknown, dir: string, entry: NativeCacheRecor
         createdAt: entry.createdAt || Date.now(),
         size: entry.size || bytes.byteLength,
     };
-    writeMeta(dir, meta);
+    meta[entry.key] = next;
+    try {
+        writeMeta(dir, meta);
+    } catch (error) {
+        if (previousFull && previousBytes) writeFileSync(previousFull, previousBytes);
+        if (previousFull !== full) {
+            try { unlinkSync(full); } catch { }
+        }
+        throw error;
+    }
 }
 
 export async function deleteEntry(_e: unknown, dir: string, key: string) {
     await ensureCacheDir(_e, dir);
     const meta = readMeta(dir);
     const info = meta[key];
-    const name = info?.file && isSafeBlobFileName(info.file) ? info.file : fileNameForKey(key);
+    const name = metadataFileName(key, info || {});
     const full = resolveBlobPath(dir, name);
     if (full && existsSync(full)) {
-        try {
-            unlinkSync(full);
-        } catch {
-        }
+        unlinkSync(full);
     }
     delete meta[key];
     writeMeta(dir, meta);
@@ -312,17 +346,42 @@ export async function deleteEntries(_e: unknown, dir: string, keys: string[]) {
 
 export async function clearCacheDir(_e: unknown, dir: string) {
     await ensureCacheDir(_e, dir);
+    const meta = readMeta(dir);
+    const trackedFiles = new Set<string>();
+    const failedKeys = new Set<string>();
+    const errors: unknown[] = [];
+
+    for (const [key, info] of Object.entries(meta)) {
+        const name = metadataFileName(key, info);
+        trackedFiles.add(name);
+        const full = resolveBlobPath(dir, name);
+        if (!full || !existsSync(full)) continue;
+        try {
+            unlinkSync(full);
+        } catch (error) {
+            failedKeys.add(key);
+            errors.push(error);
+        }
+    }
+
     const bdir = blobsDir(dir);
     if (existsSync(bdir)) {
         for (const name of readdirSync(bdir)) {
             if (!isSafeBlobFileName(name)) continue;
+            if (trackedFiles.has(name)) continue;
             const full = resolveBlobPath(dir, name);
             if (!full) continue;
             try {
                 unlinkSync(full);
-            } catch {
+            } catch (error) {
+                errors.push(error);
             }
         }
     }
-    writeMeta(dir, {});
+
+    const remaining = Object.fromEntries(
+        Object.entries(meta).filter(([key]) => failedKeys.has(key)),
+    );
+    writeMeta(dir, remaining);
+    if (errors.length) throw errors[0];
 }
